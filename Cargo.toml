@@ -1,0 +1,54 @@
+[package]
+name = "vllmtop"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+description = "A colorful terminal dashboard for monitoring vLLM servers over their Prometheus metrics API"
+repository = "https://github.com/OWNER-TBD/vllmtop"
+keywords = ["vllm", "tui", "monitoring", "prometheus", "llm"]
+categories = ["command-line-utilities"]
+# License intentionally undecided (see README). Publishing is blocked until
+# the license and repository owner are settled.
+publish = false
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4.6", features = ["derive"] }
+clap_complete = "4.6"
+humantime = "2.4"
+ratatui = "0.30"
+reqwest = { version = "0.13", default-features = false, features = [
+    "rustls",
+    "http2",
+    "charset",
+    "json",
+] }
+rusqlite = { version = "0.40", features = ["bundled"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+tokio = { version = "1.53", features = [
+    "rt-multi-thread",
+    "macros",
+    "time",
+    "sync",
+    "signal",
+] }
+toml = "1.1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+url = "2.5"
+
+# musl's default allocator is slow under multi-threaded load (tokio workers);
+# mimalloc avoids that and sidesteps jemalloc's aarch64 page-size trap.
+[target.'cfg(target_env = "musl")'.dependencies]
+mimalloc = "0.1"
+
+[dev-dependencies]
+httpmock = "0.8"
+tempfile = "3"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true
