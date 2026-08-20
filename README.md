@@ -1,23 +1,23 @@
 # vllmtop
 
 A colorful, DGXTOP-style terminal dashboard for monitoring [vLLM](https://docs.vllm.ai/)
-servers — models, request activity, throughput, latency percentiles, KV-cache
-utilization, and raw Prometheus metrics — for one local instance or a whole
-fleet, from a single static binary.
+servers — models, request activity, throughput, latency percentiles, and
+KV-cache utilization — for one local instance or a whole fleet, from a single
+static binary.
 
 ```
 vllmtop            # monitors http://127.0.0.1:8000
 ```
 
-```
- vllmtop │ 1:ALL  2:local  3:spark-a  H:HIST  R:RAW                    1.0s
- FLEET 2/2 healthy   running 12   waiting 3   completions 3.2/s
-        prompt 4.5k t/s   generation 1.2k t/s
-        fleet KV 41.3% capacity-weighted
- NAME     ST  MODEL              RUN WAIT KV           PROMPT/s GEN/s ...
- local    UP  meta-llama/Llama…    8    1 ███▎  41%      3.1k    890  ...
- spark-a  UP  Qwen/Qwen…           4    2 ██▊   38%      1.4k    310  ...
-```
+**Fleet overview** — every endpoint plus rolling history charts in one view:
+
+![Fleet view](docs/img/fleet.svg)
+
+**Endpoint detail** — activity, cache, and latency percentiles for one server:
+
+![Endpoint view](docs/img/endpoint.svg)
+
+*(Screenshots captured against local mock vLLM servers.)*
 
 ## What it is
 
@@ -31,7 +31,8 @@ vllmtop            # monitors http://127.0.0.1:8000
   Prometheus, Grafana, browser, or system OpenSSL required. TLS via rustls.
 - **Version-tolerant**: capabilities are detected from what the endpoint
   actually exposes. Missing metrics show as `--`; renamed metrics are mapped
-  through an alias table; unknown metrics stay browsable in the Raw view.
+  through an alias table; unknown or backend-specific metrics are parsed and
+  tolerated (curation simply ignores them).
 
 **What it deliberately does not do** (v1): per-request/user/conversation
 visibility, GPU/CPU/host hardware monitoring, alerts or webhooks, web UI,
@@ -121,49 +122,38 @@ redacted (no userinfo or query strings).
 | --- | --- |
 | `q` / `Ctrl+C` | quit |
 | `Tab` / `Shift+Tab` | next / previous view |
-| `1` | fleet overview |
+| `1` | fleet overview (endpoints + history charts) |
 | `2`…`9` | endpoint tabs (more endpoints: keep pressing `Tab`) |
-| `h` / `H` | History view |
-| `R` | Raw metrics view (**capital** R) |
-| `r` | force refresh now (**lowercase** r) |
-| `j`/`k`, arrows, `PgUp`/`PgDn`, `g`/`G` | select / scroll |
+| `j`/`k`, arrows | select endpoint row (fleet view) |
 | `Enter` | open the selected endpoint (fleet view) |
+| `PgUp`/`PgDn`, mouse wheel | scroll the history charts |
+| `g` / `G` | jump to top / last row |
 | `s` | cycle fleet sort column |
-| `/` | filter raw metrics (`Enter` apply, `Esc` clear) |
-| `e` | cycle endpoint filter (History/Raw) |
-| `m` | cycle model/engine series (History) |
+| `r` | force refresh now |
 | `p` | pause display refresh (collection continues) |
 | `+` / `-` | faster / slower refresh |
 | `?` | help |
 
-The `r`/`R` conflict called out in the design is resolved case-sensitively:
-lowercase refreshes, uppercase opens Raw metrics. `h` and `H` both open
-History since lowercase `h` has no competing binding.
-
 ### Views
 
-- **Fleet (1)** — every endpoint in one dense table: health/staleness,
-  model, running/waiting, KV bar, prompt/generation throughput, completion
-  rate, TTFT p95, new errors/preemptions, data age, throughput trend.
+- **Fleet (1)** — everything at a glance. Top: fleet totals and a dense
+  per-endpoint table (health/staleness, model, running/waiting, KV bar,
+  prompt/generation throughput, completion rate, worst TTFT p95, new
+  errors/preemptions, data age). Below: a scrollable grid of rolling history
+  charts (default 5 min at 1 s resolution) for running/waiting, KV usage,
+  throughputs, completion rate, latency p95s, errors, and preemptions —
+  multiple endpoints overlay as separate colored lines.
   Fleet-wide KV is **capacity-weighted** when every endpoint exposes KV
   capacity (`cache_config_info`), otherwise it is labelled
   `unweighted mean (capacity unknown)` — percentages are never silently
   averaged. Histogram data is never merged across endpoints unless bucket
   boundaries match.
-- **Endpoint (2…N)** — one server in depth: version, scrape health and
-  latency, per-(model, engine) activity, waiting-by-reason, KV bar with
+- **Endpoint (2…N)** — one server in depth: version, health and failure
+  count, per-(model, engine) activity, waiting-by-reason, KV bar with
   capacity, cache hit rates, finish reasons, errors/aborts, preemptions,
   latency percentile table (TTFT, inter-token, e2e, queue, prefill, decode,
   inference; p50/p95/p99/mean over a rolling window), and trend charts.
   Multi-engine (data-parallel) servers keep separate rows per engine.
-- **History (H)** — rolling charts (default 5 min at 1 s resolution) for
-  running/waiting, KV usage, throughputs, completion rate, latency p95s,
-  errors, preemptions. Filter by endpoint (`e`) and by model/engine series
-  (`m`). Multiple endpoints overlay as separate colored lines.
-- **Raw (R)** — every exposed metric sample: endpoint, name, type, labels,
-  value (NaN/±Inf preserved), age, staleness. Substring filter with `/`,
-  deterministic sort. Unknown or backend-specific metrics show up here even
-  though the curated views ignore them.
 
 ### Data semantics worth knowing
 
@@ -197,7 +187,7 @@ History since lowercase `h` has no competing binding.
 
 `--record PATH` appends aggregate samples (endpoint, model, engine, metric
 id, value, wall timestamp) to a SQLite database in WAL mode — the same
-curated series the History view charts. Never prompts, request bodies,
+curated series the fleet charts display. Never prompts, request bodies,
 tokens, or headers. Retention defaults to 30 days (`--retention-days`,
 `retention_days`), cleaned up in bounded batches. Writes happen on a
 dedicated thread; if the database stalls, batches are dropped and counted
@@ -221,9 +211,10 @@ is restored on quit, Ctrl+C, SIGTERM, and panics.
 
 vLLM ≥ 0.8 era metric names (V1 engine) are the primary target, with alias
 mapping for older spellings (e.g. `vllm:gpu_cache_usage_perc`,
-`vllm:time_per_output_token_seconds`). Anything unrecognized still shows in
-Raw. See [docs/METRICS.md](docs/METRICS.md) for the exact table of curated
-metrics, aliases, and behavior when they are missing.
+`vllm:time_per_output_token_seconds`). Anything unrecognized is parsed and
+skipped without breaking curation. See [docs/METRICS.md](docs/METRICS.md)
+for the exact table of curated metrics, aliases, and behavior when they are
+missing.
 
 ## Development
 
