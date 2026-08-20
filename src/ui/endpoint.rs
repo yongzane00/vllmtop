@@ -15,11 +15,17 @@ pub fn draw(frame: &mut Frame, app: &App, index: usize, area: Rect) {
     let Some(e) = app.endpoints.get(index) else {
         return;
     };
-    let [head, body] = Layout::vertical([Constraint::Length(3), Constraint::Min(0)]).areas(area);
+    let [head, pulse, body] = Layout::vertical([
+        Constraint::Length(3),
+        Constraint::Length(3),
+        Constraint::Min(0),
+    ])
+    .areas(area);
     draw_head(frame, app, e, head);
+    draw_pulse(frame, app, index, e, pulse);
 
     // Charts get the bottom 40% when there is room for them.
-    if body.height >= 16 {
+    if body.height >= 14 {
         let [tables, charts] =
             Layout::vertical([Constraint::Percentage(62), Constraint::Percentage(38)]).areas(body);
         draw_tables(frame, app, e, tables);
@@ -27,6 +33,126 @@ pub fn draw(frame: &mut Frame, app: &App, index: usize, area: Rect) {
     } else {
         draw_tables(frame, app, e, body);
     }
+}
+
+/// The "is it alive and how fast" strip: an animated GENERATING indicator,
+/// the two token rates, running (as an `n/max` bar when the config declares
+/// the server's `--max-num-seqs`), waiting, and a full-width KV-cache bar
+/// that visibly grows while a conversation is being generated.
+fn draw_pulse(frame: &mut Frame, app: &App, index: usize, e: &EndpointState, area: Rect) {
+    let t = &app.theme;
+    let ascii = t.mode == crate::ui::theme::ColorMode::Mono;
+    let agg = e.aggregate();
+    let generating = agg.running.unwrap_or(0.0) > 0.0;
+
+    // Status with a spinner while requests are running. The UI redraws at
+    // least every 500 ms tick, so the animation runs at ~2 fps — enough to
+    // read as "alive". (Display-only wall-clock use.)
+    let mut line1: Vec<Span> = Vec::new();
+    if generating {
+        let frames: &[&str] = if ascii {
+            &["|", "/", "-", "\\"]
+        } else {
+            &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
+        };
+        let ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis();
+        let glyph = frames[(ms / 250) as usize % frames.len()];
+        line1.push(Span::styled(format!(" {glyph} GENERATING"), t.value));
+    } else {
+        line1.push(Span::styled(" · IDLE      ", t.dim));
+    }
+    line1.push(Span::styled("   generation ", t.dim));
+    line1.push(Span::styled(
+        format!("{} tokens/s", format::count(agg.generation_tps)),
+        t.value,
+    ));
+    line1.push(Span::styled("   prompt ", t.dim));
+    line1.push(Span::styled(
+        format!("{} tokens/s", format::count(agg.prompt_tps)),
+        t.value,
+    ));
+    line1.push(Span::styled("   running ", t.dim));
+    let max_running = app
+        .config
+        .endpoints
+        .get(index)
+        .and_then(|c| c.max_running)
+        .filter(|m| *m > 0);
+    match (agg.running, max_running) {
+        (Some(run), Some(max)) => {
+            let frac = run / f64::from(max);
+            line1.push(Span::styled(
+                format!(
+                    "{}/{} {}",
+                    format::count(Some(run)),
+                    max,
+                    format::bar(frac, 8, ascii)
+                ),
+                t.by_level(frac, 0.75, 0.95),
+            ));
+        }
+        (run, _) => line1.push(Span::styled(format::count(run), t.value)),
+    }
+    line1.push(Span::styled("   waiting ", t.dim));
+    let wait_style = if agg.waiting.unwrap_or(0.0) > 0.0 {
+        t.warn
+    } else {
+        t.value
+    };
+    line1.push(Span::styled(format::count(agg.waiting), wait_style));
+
+    // Full-width KV bar with absolute tokens when the server exposes its
+    // capacity. This is the aggregate cache: with one conversation running
+    // it is effectively that conversation's KV growing token by token.
+    let mut line2: Vec<Span> = vec![Span::styled(" KV ", t.dim)];
+    match agg.kv_usage {
+        Some(kv) => {
+            let frac = kv.value();
+            // Reserve room for the trailing figures; the bar takes the rest.
+            let bar_width = (area.width as usize).saturating_sub(42).clamp(10, 80);
+            line2.push(Span::styled(
+                format::bar(frac, bar_width, ascii),
+                t.by_level(frac, 0.75, 0.9),
+            ));
+            line2.push(Span::styled(
+                format!(" {}", format::percent(Some(frac))),
+                t.by_level(frac, 0.75, 0.9),
+            ));
+            if !kv.is_weighted() {
+                line2.push(Span::styled(" (unweighted)", t.warn));
+            }
+            // Absolute used/capacity, when every series reports capacity.
+            if let Some(curated) = &e.curated {
+                let caps: Vec<(f64, f64)> = curated
+                    .series
+                    .values()
+                    .filter_map(|s| Some((s.kv_cache_usage?, s.kv_cache_size_tokens?)))
+                    .collect();
+                if !caps.is_empty() && caps.len() == curated.series.len() {
+                    let total: f64 = caps.iter().map(|(_, c)| c).sum();
+                    let used: f64 = caps.iter().map(|(u, c)| u * c).sum();
+                    line2.push(Span::styled(
+                        format!(
+                            "  {} / {} tok",
+                            format::count(Some(used)),
+                            format::count(Some(total))
+                        ),
+                        t.secondary,
+                    ));
+                }
+            }
+        }
+        None => line2.push(Span::styled(format::NA, t.na)),
+    }
+
+    frame.render_widget(
+        Paragraph::new(vec![Line::from(line1), Line::from(line2)])
+            .block(Block::new().borders(Borders::BOTTOM).border_style(t.dim)),
+        area,
+    );
 }
 
 fn draw_head(frame: &mut Frame, app: &App, e: &EndpointState, area: Rect) {
@@ -51,32 +177,16 @@ fn draw_head(frame: &mut Frame, app: &App, e: &EndpointState, area: Rect) {
         line1.push(Span::styled("  RESTARTED", t.crit));
     }
 
-    let mut line2 = vec![
-        Span::styled("   success ", t.dim),
-        Span::styled(format::ago(e.last_ok_at, now), t.text),
-        Span::styled("  ", t.dim),
-        Span::styled(attempt_status(e, now), t.secondary),
-        Span::styled("  in ", t.dim),
-        Span::styled(
-            e.last_scrape_duration
-                .map(format::brief_duration)
-                .unwrap_or_else(|| format::NA.into()),
-            t.text,
-        ),
-        Span::styled("  failures ", t.dim),
-        Span::styled(
-            format!("{}", e.total_failures),
-            if e.total_failures > 0 { t.warn } else { t.text },
-        ),
-    ];
+    // Second line: only things worth flagging plus the served models.
+    let mut line2: Vec<Span> = Vec::new();
     if e.parse_issue_count > 0 {
         line2.push(Span::styled(
-            format!("  parse-issues {}", e.parse_issue_count),
+            format!("   parse-issues {}", e.parse_issue_count),
             t.warn,
         ));
     }
     if !e.served_models.is_empty() {
-        line2.push(Span::styled("  models ", t.dim));
+        line2.push(Span::styled("   models ", t.dim));
         line2.push(Span::styled(
             format::truncate(&e.served_models.join(", "), 40),
             t.secondary,
@@ -96,6 +206,9 @@ fn draw_head(frame: &mut Frame, app: &App, e: &EndpointState, area: Rect) {
     );
 }
 
+/// Not currently displayed (the header shows only the failure count), but
+/// kept with its test for easy reinstatement.
+#[allow(dead_code)]
 fn attempt_status(endpoint: &EndpointState, now: Instant) -> String {
     if let Some(started) = endpoint.scraping_since {
         return format!(
@@ -167,19 +280,63 @@ fn push_series_activity(
 
     let kv = |label: &str, value: String, style| {
         Line::from(vec![
-            Span::styled(format!("   {label:<18}"), t.dim),
+            // Width fits the longest label, "generation tokens/s" (19).
+            Span::styled(format!("   {label:<20}"), t.dim),
             Span::styled(value, style),
         ])
     };
 
-    let wait_style = if s.waiting.unwrap_or(0.0) > 0.0 {
-        t.warn
-    } else {
-        t.value
-    };
-    lines.push(kv("running", format::count(s.running), t.value));
-    let mut waiting_text = format::count(s.waiting);
-    if !s.waiting_by_reason.is_empty() {
+    // With one series, running/waiting/KV/token rates already live in the
+    // pulse strip above — repeating them here is noise. Multi-series
+    // (multi-model / data-parallel) endpoints keep the full per-series rows
+    // because the pulse strip only shows aggregates.
+    if multi {
+        let wait_style = if s.waiting.unwrap_or(0.0) > 0.0 {
+            t.warn
+        } else {
+            t.value
+        };
+        lines.push(kv("running", format::count(s.running), t.value));
+        let mut waiting_text = format::count(s.waiting);
+        if !s.waiting_by_reason.is_empty() {
+            let reasons: Vec<String> = s
+                .waiting_by_reason
+                .iter()
+                .filter(|(_, v)| **v > 0.0)
+                .map(|(k, v)| format!("{k}:{}", format::count(Some(*v))))
+                .collect();
+            if !reasons.is_empty() {
+                waiting_text = format!("{waiting_text} ({})", reasons.join(" "));
+            }
+        }
+        lines.push(kv("waiting", waiting_text, wait_style));
+
+        match s.kv_cache_usage {
+            Some(u) => {
+                let style = t.by_level(u, 0.75, 0.9);
+                let mut text =
+                    format!("{} {}", format::bar(u, 20, ascii), format::percent(Some(u)));
+                if let Some(cap) = s.kv_cache_size_tokens {
+                    text.push_str(&format!("  of {} tok", format::count(Some(cap))));
+                }
+                lines.push(kv("KV cache", text, style));
+            }
+            None => lines.push(kv("KV cache", format::NA.into(), t.na)),
+        }
+
+        lines.push(kv(
+            "prompt tokens/s",
+            format::count(d.and_then(|d| d.prompt_tps)),
+            t.value,
+        ));
+        lines.push(kv(
+            "generation tokens/s",
+            format::count(d.and_then(|d| d.generation_tps)),
+            t.value,
+        ));
+    } else if !s.waiting_by_reason.is_empty() {
+        // Waiting reasons have no home in the pulse strip; show them when
+        // any are non-zero.
         let reasons: Vec<String> = s
             .waiting_by_reason
             .iter()
@@ -187,33 +344,9 @@ fn push_series_activity(
             .map(|(k, v)| format!("{k}:{}", format::count(Some(*v))))
             .collect();
         if !reasons.is_empty() {
-            waiting_text = format!("{waiting_text} ({})", reasons.join(" "));
+            lines.push(kv("waiting reasons", reasons.join(" "), t.warn));
         }
     }
-    lines.push(kv("waiting", waiting_text, wait_style));
-
-    match s.kv_cache_usage {
-        Some(u) => {
-            let style = t.by_level(u, 0.75, 0.9);
-            let mut text = format!("{} {}", format::bar(u, 20, ascii), format::percent(Some(u)));
-            if let Some(cap) = s.kv_cache_size_tokens {
-                text.push_str(&format!("  of {} tok", format::count(Some(cap))));
-            }
-            lines.push(kv("KV cache", text, style));
-        }
-        None => lines.push(kv("KV cache", format::NA.into(), t.na)),
-    }
-
-    lines.push(kv(
-        "prompt t/s",
-        format::count(d.and_then(|d| d.prompt_tps)),
-        t.value,
-    ));
-    lines.push(kv(
-        "generation t/s",
-        format::count(d.and_then(|d| d.generation_tps)),
-        t.value,
-    ));
     lines.push(kv(
         "completions/s",
         format::count(d.and_then(|d| d.request_rate)),
@@ -290,14 +423,15 @@ fn draw_latency(frame: &mut Frame, app: &App, e: &EndpointState, area: Rect) {
         return;
     };
 
-    const ROWS: [(&str, &str); 7] = [
+    // "inference time" (≈ prefill + decode) is deliberately omitted as
+    // redundant with the phase split below it.
+    const ROWS: [(&str, &str); 6] = [
         (hist::TTFT, "TTFT"),
         (hist::INTER_TOKEN_LATENCY, "inter-token"),
         (hist::E2E_LATENCY, "e2e latency"),
         (hist::QUEUE_TIME, "queue time"),
         (hist::PREFILL_TIME, "prefill time"),
         (hist::DECODE_TIME, "decode time"),
-        (hist::INFERENCE_TIME, "inference time"),
     ];
 
     let mut rows: Vec<Row> = Vec::new();
@@ -393,7 +527,7 @@ fn draw_trends(frame: &mut Frame, app: &App, e: &EndpointState, area: Rect) {
         frame,
         app,
         left,
-        "generation t/s",
+        "generation tokens/s",
         &[crate::state::series_id::GENERATION_TPS],
         Some(e),
     );

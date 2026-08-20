@@ -74,6 +74,9 @@ pub struct EndpointConfig {
     pub bearer_token_env: Option<String>,
     /// Header name → env var NAME holding the header value.
     pub header_env: BTreeMap<String, String>,
+    /// The server's `--max-num-seqs`, declared by the user (vLLM does not
+    /// export it). When set, running requests render as an `n/max` bar.
+    pub max_running: Option<u32>,
 }
 
 impl EndpointConfig {
@@ -161,6 +164,8 @@ struct FileEndpoint {
     bearer_token_env: Option<String>,
     #[serde(default)]
     header_env: BTreeMap<String, String>,
+    /// Mirror of the server's `--max-num-seqs`, for the running-requests bar.
+    max_running: Option<u32>,
 }
 
 // ---------------------------------------------------------------------------
@@ -286,6 +291,7 @@ fn default_endpoint() -> EndpointConfig {
         url: Url::parse(DEFAULT_ENDPOINT_URL).expect("default URL is valid"),
         bearer_token_env: None,
         header_env: BTreeMap::new(),
+        max_running: None,
     }
 }
 
@@ -297,11 +303,23 @@ fn parse_endpoint_arg(spec: &str) -> Result<EndpointConfig, ConfigError> {
         Some(eq) if eq < scheme_pos => (Some(&spec[..eq]), &spec[eq + 1..]),
         _ => (None, spec),
     };
-    build_endpoint(name.map(str::to_string), url_text, None, BTreeMap::new())
+    build_endpoint(
+        name.map(str::to_string),
+        url_text,
+        None,
+        BTreeMap::new(),
+        None,
+    )
 }
 
 fn file_endpoint(fe: FileEndpoint) -> Result<EndpointConfig, ConfigError> {
-    build_endpoint(fe.name, &fe.url, fe.bearer_token_env, fe.header_env)
+    build_endpoint(
+        fe.name,
+        &fe.url,
+        fe.bearer_token_env,
+        fe.header_env,
+        fe.max_running,
+    )
 }
 
 fn build_endpoint(
@@ -309,6 +327,7 @@ fn build_endpoint(
     url_text: &str,
     bearer_token_env: Option<String>,
     header_env: BTreeMap<String, String>,
+    max_running: Option<u32>,
 ) -> Result<EndpointConfig, ConfigError> {
     // Error paths must never echo raw URL text (it may carry credentials in
     // userinfo or query form, which we also refuse to send).
@@ -339,6 +358,7 @@ fn build_endpoint(
         url,
         bearer_token_env,
         header_env,
+        max_running,
     })
 }
 
@@ -633,6 +653,7 @@ url = "https://10.0.0.22:8443"
             url: Url::parse("https://h:1").unwrap(),
             bearer_token_env: Some("TOK".into()),
             header_env: BTreeMap::from([("X-Auth".to_string(), "XAUTH".to_string())]),
+            max_running: None,
         };
         let ok = ep
             .resolve_auth(|k| match k {

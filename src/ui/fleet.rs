@@ -107,9 +107,9 @@ fn draw_summary(frame: &mut Frame, app: &App, area: Rect) {
         ]),
         Line::from(vec![
             Span::styled("        prompt ", t.dim),
-            Span::styled(format!("{} t/s", format::count(prompt)), t.value),
+            Span::styled(format!("{} tokens/s", format::count(prompt)), t.value),
             Span::styled("   generation ", t.dim),
-            Span::styled(format!("{} t/s", format::count(generation)), t.value),
+            Span::styled(format!("{} tokens/s", format::count(generation)), t.value),
         ]),
         Line::from([vec![Span::styled("        fleet KV ", t.dim)], kv_span].concat()),
     ];
@@ -160,7 +160,7 @@ fn draw_table(frame: &mut Frame, app: &App, area: Rect) {
             "ERR",
             "PRE",
             "AGE",
-            if wide { "GEN t/s TREND" } else { "" },
+            if wide { "GEN tokens/s TREND" } else { "" },
         ]
         .into_iter()
         .map(|h| Cell::from(Span::styled(h, t.heading))),

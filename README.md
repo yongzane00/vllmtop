@@ -148,12 +148,16 @@ redacted (no userinfo or query strings).
   `unweighted mean (capacity unknown)` — percentages are never silently
   averaged. Histogram data is never merged across endpoints unless bucket
   boundaries match.
-- **Endpoint (2…N)** — one server in depth: version, health and failure
-  count, per-(model, engine) activity, waiting-by-reason, KV bar with
-  capacity, cache hit rates, finish reasons, errors/aborts, preemptions,
-  latency percentile table (TTFT, inter-token, e2e, queue, prefill, decode,
-  inference; p50/p95/p99/mean over a rolling window), and trend charts.
-  Multi-engine (data-parallel) servers keep separate rows per engine.
+- **Endpoint (2…N)** — one server in depth. A pulse strip answers the first
+  question at a glance: an animated `GENERATING` indicator while requests
+  are running, generation/prompt tokens/s, running (as an `n/max` bar when
+  the endpoint's `max_running` mirrors the server's `--max-num-seqs` —
+  vLLM doesn't export that cap), waiting, and a full-width KV-cache bar
+  with absolute tokens that visibly grows while a conversation generates.
+  Below it: cache hit rates, finish reasons, errors/aborts, preemptions,
+  the latency percentile table (TTFT, inter-token, e2e, queue, prefill,
+  decode; p50/p95/p99/mean over a rolling window), and trend charts.
+  Multi-engine (data-parallel) servers keep separate per-series rows.
 
 ### Data semantics worth knowing
 

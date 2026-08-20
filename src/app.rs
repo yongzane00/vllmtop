@@ -48,7 +48,7 @@ impl FleetSort {
             FleetSort::Name => "name",
             FleetSort::Running => "running",
             FleetSort::Waiting => "waiting",
-            FleetSort::GenTps => "gen t/s",
+            FleetSort::GenTps => "gen tokens/s",
         }
     }
 }

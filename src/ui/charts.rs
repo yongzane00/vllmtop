@@ -176,10 +176,16 @@ fn draw_metric_chart(
     if !y_max.is_finite() || y_max <= 0.0 {
         y_max = 1.0;
     }
-    let y_max = if kind == ValueKind::Fraction {
-        1.0f64.max(y_max)
-    } else {
-        y_max * 1.1
+    // Integer count series (requests, new errors) get integer axis bounds
+    // (max+1) — a fractional headroom label like "1.1 requests" is nonsense.
+    let all_integers = plotted
+        .iter()
+        .flat_map(|(_, pts, _)| pts.iter().map(|p| p.1))
+        .all(|v| v.fract() == 0.0);
+    let y_max = match kind {
+        ValueKind::Fraction => 1.0f64.max(y_max),
+        ValueKind::Count if all_integers => y_max + 1.0,
+        _ => y_max * 1.1,
     };
 
     let datasets: Vec<Dataset> = plotted
@@ -276,7 +282,17 @@ pub fn draw_single_chart(
     if !y_max.is_finite() || y_max <= 0.0 {
         y_max = 1.0;
     }
-    let y_max = y_max * 1.1;
+    // Integer series (request counts) get an integer bound; fractional
+    // series (throughput) keep the 10% headroom.
+    let all_integers = lines_data
+        .iter()
+        .flat_map(|(_, pts)| pts.iter().map(|p| p.1))
+        .all(|v| v.fract() == 0.0);
+    let y_max = if all_integers {
+        y_max + 1.0
+    } else {
+        y_max * 1.1
+    };
 
     let datasets: Vec<Dataset> = lines_data
         .iter()

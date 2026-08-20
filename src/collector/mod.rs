@@ -491,6 +491,7 @@ mod tests {
             url: Url::parse(url).unwrap(),
             bearer_token_env: None,
             header_env: BTreeMap::new(),
+            max_running: None,
         }
     }
 
@@ -543,6 +544,7 @@ mod tests {
             url: Url::parse("https://h:1").unwrap(),
             bearer_token_env: Some("VLLMTOP_TEST_UNSET_VAR_XYZ".into()),
             header_env: BTreeMap::new(),
+            max_running: None,
         };
         let err = build_client(&endpoint).unwrap_err();
         assert!(err.contains("VLLMTOP_TEST_UNSET_VAR_XYZ"));
