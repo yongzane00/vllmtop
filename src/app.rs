@@ -15,13 +15,14 @@ use crate::storage::{Recorder, SampleRow, now_ms};
 use crate::ui::theme::Theme;
 
 /// Which screen is showing. Ordering for Tab cycling:
-/// Fleet → Endpoint(0..n) → History → Raw → Fleet…
+/// Fleet → Endpoint(0..n) → Fleet…
+///
+/// The fleet view embeds the rolling history charts below the endpoint
+/// table (PgUp/PgDn scrolls them); there is no separate History or Raw view.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum View {
     Fleet,
     Endpoint(usize),
-    History,
-    Raw,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -52,25 +53,6 @@ impl FleetSort {
     }
 }
 
-#[derive(Debug, Default)]
-pub struct RawViewState {
-    pub filter: String,
-    pub editing: bool,
-    pub scroll: usize,
-    /// None = all endpoints.
-    pub endpoint_filter: Option<usize>,
-}
-
-#[derive(Debug, Default)]
-pub struct HistoryViewState {
-    /// None = all endpoints overlaid.
-    pub endpoint_filter: Option<usize>,
-    /// Index into the union of observed series keys; None = all/aggregate.
-    pub model_filter: Option<usize>,
-    /// Scroll offset in chart-grid rows.
-    pub scroll: usize,
-}
-
 pub struct App {
     pub config: Config,
     pub theme: Theme,
@@ -78,8 +60,9 @@ pub struct App {
     pub view: View,
     pub fleet_selected: usize,
     pub fleet_sort: FleetSort,
-    pub raw: RawViewState,
-    pub hist: HistoryViewState,
+    /// Scroll offset (in chart-grid rows) of the charts embedded in the
+    /// fleet view; the renderer clamps it to the real row count.
+    pub fleet_chart_scroll: usize,
     pub paused: bool,
     pub show_help: bool,
     /// Runtime-adjustable; starts at config.refresh_interval.
@@ -120,8 +103,7 @@ impl App {
             view: View::Fleet,
             fleet_selected: 0,
             fleet_sort: FleetSort::Name,
-            raw: RawViewState::default(),
-            hist: HistoryViewState::default(),
+            fleet_chart_scroll: 0,
             paused: false,
             show_help: false,
             recorder,
@@ -190,6 +172,29 @@ impl App {
 
     pub fn handle_event(&mut self, event: AppEvent) {
         match event {
+            AppEvent::MetricsStarted { endpoint, at } => {
+                let Some(state) = self.endpoints.get_mut(endpoint) else {
+                    return;
+                };
+                state.mark_attempt_started(at);
+                if !self.paused {
+                    self.dirty = true;
+                }
+            }
+            AppEvent::OptionalUpdate {
+                endpoint,
+                healthy,
+                version,
+                models,
+            } => {
+                let Some(state) = self.endpoints.get_mut(endpoint) else {
+                    return;
+                };
+                state.apply_optional(healthy, version, models);
+                if !self.paused {
+                    self.dirty = true;
+                }
+            }
             AppEvent::Scrape { endpoint, outcome } => {
                 let Some(state) = self.endpoints.get_mut(endpoint) else {
                     return;
@@ -210,8 +215,8 @@ impl App {
             }
             AppEvent::Mouse(mouse) => {
                 match mouse.kind {
-                    MouseEventKind::ScrollUp => self.scroll_by(-1),
-                    MouseEventKind::ScrollDown => self.scroll_by(1),
+                    MouseEventKind::ScrollUp => self.scroll_charts(-1),
+                    MouseEventKind::ScrollDown => self.scroll_charts(1),
                     _ => {}
                 }
                 self.dirty = true;
@@ -243,7 +248,7 @@ impl App {
     }
 
     fn handle_key(&mut self, key: KeyEvent) {
-        // Ctrl+C always quits, even mid-filter-edit.
+        // Ctrl+C always quits.
         if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
             self.should_quit = true;
             return;
@@ -258,10 +263,6 @@ impl App {
             }
             return;
         }
-        if self.raw.editing {
-            self.handle_filter_edit(key);
-            return;
-        }
         match key.code {
             KeyCode::Char('q') => self.should_quit = true,
             KeyCode::Char('?') => self.show_help = true,
@@ -274,9 +275,6 @@ impl App {
                     self.view = View::Endpoint(idx);
                 }
             }
-            KeyCode::Char('h') | KeyCode::Char('H') => self.view = View::History,
-            // Case matters: R is Raw metrics, r is refresh (documented in ?).
-            KeyCode::Char('R') => self.view = View::Raw,
             KeyCode::Char('r') => self.control.force_refresh(),
             KeyCode::Char('p') => self.paused = !self.paused,
             // '+' = faster refresh = SHORTER interval (matches README).
@@ -287,29 +285,17 @@ impl App {
                     self.fleet_sort = self.fleet_sort.next();
                 }
             }
-            KeyCode::Char('/') => {
-                if self.view == View::Raw {
-                    self.raw.editing = true;
-                }
+            KeyCode::Char('j') | KeyCode::Down => self.move_selection(1),
+            KeyCode::Char('k') | KeyCode::Up => self.move_selection(-1),
+            // The chart grid below the fleet table scrolls independently of
+            // the row selection.
+            KeyCode::PageDown => self.scroll_charts(1),
+            KeyCode::PageUp => self.scroll_charts(-1),
+            KeyCode::Char('g') | KeyCode::Home => {
+                self.fleet_selected = 0;
+                self.fleet_chart_scroll = 0;
             }
-            KeyCode::Esc => {
-                if self.view == View::Raw && !self.raw.filter.is_empty() {
-                    self.raw.filter.clear();
-                    self.raw.scroll = 0;
-                }
-            }
-            KeyCode::Char('e') => self.cycle_endpoint_filter(),
-            KeyCode::Char('m') => {
-                if self.view == View::History {
-                    self.cycle_model_filter();
-                }
-            }
-            KeyCode::Char('j') | KeyCode::Down => self.scroll_by(1),
-            KeyCode::Char('k') | KeyCode::Up => self.scroll_by(-1),
-            KeyCode::PageDown => self.scroll_by(10),
-            KeyCode::PageUp => self.scroll_by(-10),
-            KeyCode::Char('g') | KeyCode::Home => self.scroll_home(),
-            KeyCode::Char('G') | KeyCode::End => self.scroll_by(i64::MAX / 2),
+            KeyCode::Char('G') | KeyCode::End => self.move_selection(i64::MAX / 2),
             KeyCode::Enter if self.view == View::Fleet => {
                 let idx = self
                     .sorted_endpoint_indices()
@@ -318,29 +304,6 @@ impl App {
                 if let Some(idx) = idx {
                     self.view = View::Endpoint(idx);
                 }
-            }
-            _ => {}
-        }
-    }
-
-    fn handle_filter_edit(&mut self, key: KeyEvent) {
-        match key.code {
-            KeyCode::Esc => {
-                self.raw.filter.clear();
-                self.raw.editing = false;
-                self.raw.scroll = 0;
-            }
-            KeyCode::Enter => self.raw.editing = false,
-            KeyCode::Backspace => {
-                self.raw.filter.pop();
-                self.raw.scroll = 0;
-            }
-            KeyCode::Char(c)
-                if !key.modifiers.contains(KeyModifiers::CONTROL)
-                    && self.raw.filter.len() < 128 =>
-            {
-                self.raw.filter.push(c);
-                self.raw.scroll = 0;
             }
             _ => {}
         }
@@ -362,80 +325,26 @@ impl App {
         self.control.set_interval(self.refresh_interval);
     }
 
-    fn cycle_endpoint_filter(&mut self) {
-        let n = self.endpoints.len();
-        let slot = match self.view {
-            View::History => &mut self.hist.endpoint_filter,
-            View::Raw => &mut self.raw.endpoint_filter,
-            _ => return,
-        };
-        *slot = match *slot {
-            None => Some(0),
-            Some(i) if i + 1 < n => Some(i + 1),
-            Some(_) => None,
-        };
-        self.raw.scroll = 0;
-        self.hist.scroll = 0;
-    }
-
-    /// All (model, engine) series keys observed across endpoints, sorted —
-    /// the domain for the History view's model filter.
-    pub fn observed_series(&self) -> Vec<crate::metrics::normalize::SeriesKey> {
-        let mut set = std::collections::BTreeSet::new();
-        for e in &self.endpoints {
-            if let Some(c) = &e.curated {
-                set.extend(c.series.keys().cloned());
-            }
-        }
-        set.into_iter().collect()
-    }
-
-    fn cycle_model_filter(&mut self) {
-        let n = self.observed_series().len();
-        if n == 0 {
-            self.hist.model_filter = None;
+    /// Move the fleet-table row selection (i128: G's huge jump plus a large
+    /// value must clamp, never overflow).
+    fn move_selection(&mut self, delta: i64) {
+        if self.view != View::Fleet {
             return;
         }
-        self.hist.model_filter = match self.hist.model_filter {
-            None => Some(0),
-            Some(i) if i + 1 < n => Some(i + 1),
-            Some(_) => None,
-        };
+        let max = self.endpoints.len().saturating_sub(1);
+        let next = (self.fleet_selected as i128 + i128::from(delta)).clamp(0, max as i128);
+        self.fleet_selected = next as usize;
     }
 
-    fn scroll_by(&mut self, delta: i64) {
-        // i128 arithmetic: G's huge jump delta plus an already-large scroll
-        // must clamp, never overflow.
-        let apply = |v: &mut usize, max: usize| {
-            let next = (*v as i128 + i128::from(delta)).clamp(0, max as i128);
-            *v = next as usize;
-        };
-        match self.view {
-            View::Fleet => {
-                let max = self.endpoints.len().saturating_sub(1);
-                apply(&mut self.fleet_selected, max);
-            }
-            View::Raw => {
-                // Upper bound enforced during render (it knows the row count);
-                // a huge cap here just lets G jump far.
-                apply(&mut self.raw.scroll, usize::MAX / 2);
-            }
-            View::History => {
-                // Enough for the 1-column layout on a short terminal; the
-                // renderer clamps to the real row count.
-                apply(&mut self.hist.scroll, 16);
-            }
-            View::Endpoint(_) => {}
+    /// Scroll the chart grid embedded in the fleet view. The bound here only
+    /// needs to cover the 1-column layout; the renderer clamps to the real
+    /// row count.
+    fn scroll_charts(&mut self, delta: i64) {
+        if self.view != View::Fleet {
+            return;
         }
-    }
-
-    fn scroll_home(&mut self) {
-        match self.view {
-            View::Fleet => self.fleet_selected = 0,
-            View::Raw => self.raw.scroll = 0,
-            View::History => self.hist.scroll = 0,
-            View::Endpoint(_) => {}
-        }
+        let next = (self.fleet_chart_scroll as i128 + i128::from(delta)).clamp(0, 16);
+        self.fleet_chart_scroll = next as usize;
     }
 
     pub fn next_view(&self, view: View) -> View {
@@ -445,35 +354,31 @@ impl App {
                 if n > 0 {
                     View::Endpoint(0)
                 } else {
-                    View::History
+                    View::Fleet
                 }
             }
             View::Endpoint(i) => {
                 if i + 1 < n {
                     View::Endpoint(i + 1)
                 } else {
-                    View::History
+                    View::Fleet
                 }
             }
-            View::History => View::Raw,
-            View::Raw => View::Fleet,
         }
     }
 
     pub fn prev_view(&self, view: View) -> View {
         let n = self.endpoints.len();
         match view {
-            View::Fleet => View::Raw,
-            View::Endpoint(0) => View::Fleet,
-            View::Endpoint(i) => View::Endpoint(i - 1),
-            View::History => {
+            View::Fleet => {
                 if n > 0 {
                     View::Endpoint(n - 1)
                 } else {
                     View::Fleet
                 }
             }
-            View::Raw => View::History,
+            View::Endpoint(0) => View::Fleet,
+            View::Endpoint(i) => View::Endpoint(i - 1),
         }
     }
 
@@ -544,7 +449,7 @@ mod tests {
         let app = test_app(&["http://h1:1", "http://h2:2"]);
         let mut v = View::Fleet;
         let mut seen = vec![v];
-        for _ in 0..4 {
+        for _ in 0..3 {
             v = app.next_view(v);
             seen.push(v);
         }
@@ -554,15 +459,13 @@ mod tests {
                 View::Fleet,
                 View::Endpoint(0),
                 View::Endpoint(1),
-                View::History,
-                View::Raw
+                View::Fleet
             ]
         );
-        assert_eq!(app.next_view(View::Raw), View::Fleet);
         // And backwards.
-        assert_eq!(app.prev_view(View::Fleet), View::Raw);
+        assert_eq!(app.prev_view(View::Fleet), View::Endpoint(1));
         assert_eq!(app.prev_view(View::Endpoint(0)), View::Fleet);
-        assert_eq!(app.prev_view(View::History), View::Endpoint(1));
+        assert_eq!(app.prev_view(View::Endpoint(1)), View::Endpoint(0));
     }
 
     #[test]
@@ -593,34 +496,14 @@ mod tests {
     }
 
     #[test]
-    fn case_sensitive_r_bindings() {
+    fn removed_view_keys_do_not_navigate() {
         let mut app = test_app(&["http://h1:1"]);
-        app.handle_key(key(KeyCode::Char('R')));
-        assert_eq!(app.view, View::Raw);
-        // Lowercase r must NOT navigate (it forces a refresh instead).
-        app.handle_key(key(KeyCode::Char('1')));
-        app.handle_key(key(KeyCode::Char('r')));
-        assert_eq!(app.view, View::Fleet);
-    }
-
-    #[test]
-    fn filter_editing_captures_q_and_esc_clears() {
-        let mut app = test_app(&["http://h1:1"]);
-        app.handle_key(key(KeyCode::Char('R')));
-        app.handle_key(key(KeyCode::Char('/')));
-        assert!(app.raw.editing);
-        for c in "quest".chars() {
-            app.handle_key(key(KeyCode::Char(c)));
+        // 'R' (old Raw view), 'H' (old History view), and lowercase 'r'
+        // (refresh) must all leave the view unchanged.
+        for k in ['R', 'H', 'h', 'r', '/', 'e', 'm'] {
+            app.handle_key(key(KeyCode::Char(k)));
+            assert_eq!(app.view, View::Fleet, "key {k:?} must not navigate");
         }
-        // 'q' went into the filter, not quit.
-        assert!(!app.should_quit());
-        assert_eq!(app.raw.filter, "quest");
-        app.handle_key(key(KeyCode::Enter));
-        assert!(!app.raw.editing);
-        assert_eq!(app.raw.filter, "quest");
-        // Esc outside editing clears the filter.
-        app.handle_key(key(KeyCode::Esc));
-        assert!(app.raw.filter.is_empty());
     }
 
     #[test]
@@ -635,12 +518,12 @@ mod tests {
     }
 
     #[test]
-    fn interval_adjustment_clamps_and_plus_means_faster() {
+    fn interval_adjustment_clamps_at_one_second_and_minus_means_slower() {
         let mut app = test_app(&["http://h1:1"]);
         assert_eq!(app.refresh_interval, Duration::from_millis(1000));
         // '+' = faster = shorter interval (documented direction).
         app.handle_key(key(KeyCode::Char('+')));
-        assert_eq!(app.refresh_interval, Duration::from_millis(500));
+        assert_eq!(app.refresh_interval, Duration::from_millis(MIN_REFRESH_MS));
         for _ in 0..10 {
             app.handle_key(key(KeyCode::Char('+')));
         }
@@ -652,15 +535,30 @@ mod tests {
     }
 
     #[test]
-    fn repeated_end_key_never_overflows_scroll() {
-        let mut app = test_app(&["http://h1:1"]);
-        app.handle_key(key(KeyCode::Char('R')));
+    fn repeated_end_key_never_overflows_selection() {
+        let mut app = test_app(&["http://h1:1", "http://h2:2"]);
         for _ in 0..5 {
             app.handle_key(key(KeyCode::Char('G')));
             app.handle_key(key(KeyCode::End));
         }
-        // Clamped to the raw view's cap, no wrap/panic.
-        assert!(app.raw.scroll > 0);
+        // Clamped to the last row, no wrap/panic.
+        assert_eq!(app.fleet_selected, 1);
+    }
+
+    #[test]
+    fn chart_scroll_is_independent_of_row_selection_and_clamped() {
+        let mut app = test_app(&["http://h1:1", "http://h2:2"]);
+        app.handle_key(key(KeyCode::Char('j')));
+        assert_eq!(app.fleet_selected, 1);
+        assert_eq!(app.fleet_chart_scroll, 0);
+        for _ in 0..100 {
+            app.handle_key(key(KeyCode::PageDown));
+        }
+        assert_eq!(app.fleet_chart_scroll, 16); // clamped
+        assert_eq!(app.fleet_selected, 1); // selection untouched
+        app.handle_key(key(KeyCode::Char('g')));
+        assert_eq!(app.fleet_chart_scroll, 0);
+        assert_eq!(app.fleet_selected, 0);
     }
 
     #[test]
@@ -685,6 +583,34 @@ mod tests {
     }
 
     #[test]
+    fn metrics_started_event_updates_attempt_state() {
+        let mut app = test_app(&["http://h1:1"]);
+        let started = Instant::now();
+        app.handle_event(AppEvent::MetricsStarted {
+            endpoint: 0,
+            at: started,
+        });
+        assert_eq!(app.endpoints[0].last_attempt_at, Some(started));
+        assert_eq!(app.endpoints[0].scraping_since, Some(started));
+    }
+
+    #[test]
+    fn optional_probe_event_updates_metadata_without_a_metrics_scrape() {
+        let mut app = test_app(&["http://h1:1"]);
+        app.handle_event(AppEvent::OptionalUpdate {
+            endpoint: 0,
+            healthy: Some(false),
+            version: Some("1.2.3".into()),
+            models: Some(vec!["model-a".into()]),
+        });
+        let endpoint = &app.endpoints[0];
+        assert_eq!(endpoint.healthy, Some(false));
+        assert_eq!(endpoint.vllm_version.as_deref(), Some("1.2.3"));
+        assert_eq!(endpoint.served_models, ["model-a"]);
+        assert_eq!(endpoint.total_scrapes, 0);
+    }
+
+    #[test]
     fn help_overlay_swallows_navigation() {
         let mut app = test_app(&["http://h1:1"]);
         app.handle_key(key(KeyCode::Char('?')));
@@ -693,18 +619,5 @@ mod tests {
         assert_eq!(app.view, View::Fleet); // unchanged
         app.handle_key(key(KeyCode::Esc));
         assert!(!app.show_help);
-    }
-
-    #[test]
-    fn endpoint_filter_cycles_all_then_each_then_all() {
-        let mut app = test_app(&["http://h1:1", "http://h2:2"]);
-        app.handle_key(key(KeyCode::Char('R')));
-        assert_eq!(app.raw.endpoint_filter, None);
-        app.handle_key(key(KeyCode::Char('e')));
-        assert_eq!(app.raw.endpoint_filter, Some(0));
-        app.handle_key(key(KeyCode::Char('e')));
-        assert_eq!(app.raw.endpoint_filter, Some(1));
-        app.handle_key(key(KeyCode::Char('e')));
-        assert_eq!(app.raw.endpoint_filter, None);
     }
 }

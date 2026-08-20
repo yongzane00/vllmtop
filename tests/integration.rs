@@ -25,7 +25,7 @@ fn config_for(urls: &[String]) -> Config {
     let mut args = vec![
         "vllmtop".to_string(),
         "--refresh-interval-ms".into(),
-        "250".into(),
+        "1000".into(),
     ];
     for (i, u) in urls.iter().enumerate() {
         args.push("--endpoint".into());
@@ -60,6 +60,53 @@ async fn next_scrape_for(
             _ => {}
         }
     }
+}
+
+async fn next_metrics_started_for(
+    rx: &mut mpsc::Receiver<AppEvent>,
+    endpoint: usize,
+) -> std::time::Instant {
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let event = rx.recv().await.expect("event channel closed unexpectedly");
+            match event {
+                AppEvent::MetricsStarted { endpoint: idx, at } if idx == endpoint => return at,
+                _ => {}
+            }
+        }
+    })
+    .await
+    .expect("timed out waiting for metrics-start event")
+}
+
+async fn apply_next_optional_for(
+    rx: &mut mpsc::Receiver<AppEvent>,
+    endpoint: usize,
+    state: &mut EndpointState,
+) {
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let event = rx.recv().await.expect("event channel closed unexpectedly");
+            match event {
+                AppEvent::OptionalUpdate {
+                    endpoint: idx,
+                    healthy,
+                    version,
+                    models,
+                } if idx == endpoint => {
+                    state.apply_optional(healthy, version, models);
+                    return;
+                }
+                AppEvent::Scrape {
+                    endpoint: idx,
+                    outcome,
+                } if idx == endpoint => state.apply(outcome),
+                _ => {}
+            }
+        }
+    })
+    .await
+    .expect("timed out waiting for optional-probe event");
 }
 
 fn serve_fixture(server: &MockServer) {
@@ -99,6 +146,7 @@ async fn full_pipeline_against_mock_server() {
     let mut state = state_for(&config, 0);
     let outcome = next_scrape_for(&mut rx, 0).await;
     state.apply(outcome);
+    apply_next_optional_for(&mut rx, 0, &mut state).await;
 
     // Connection + optional endpoints.
     assert_eq!(state.status, ConnStatus::Connected);
@@ -241,6 +289,101 @@ async fn missing_optional_endpoints_leave_metadata_unknown() {
     // A server without /health (404) is UNKNOWN, not unhealthy: the endpoint
     // is optional and its absence must show as N/A.
     assert_eq!(state.healthy, None);
+}
+
+#[tokio::test]
+async fn slow_metrics_scrape_skips_missed_tick_and_stays_anchored() {
+    let server = MockServer::start_async().await;
+    server
+        .mock_async(|when, then| {
+            when.method(GET).path("/metrics");
+            then.status(200)
+                .delay(Duration::from_millis(1_500))
+                .body(FIXTURE);
+        })
+        .await;
+
+    let args = [
+        "vllmtop".to_string(),
+        "--refresh-interval-ms".into(),
+        "1000".into(),
+        "--endpoint".into(),
+        format!("ep0={}", server.base_url()),
+    ];
+    let config = load(&Cli::parse_from(args), |_| None).unwrap();
+    let (tx, mut rx) = mpsc::channel(64);
+    let _control = spawn_all(&config, tx);
+
+    let first = next_metrics_started_for(&mut rx, 0).await;
+    let second = next_metrics_started_for(&mut rx, 0).await;
+    let gap = second.duration_since(first);
+    assert!(gap >= Duration::from_millis(1_800), "gap was {gap:?}");
+    assert!(gap <= Duration::from_millis(2_250), "gap was {gap:?}");
+}
+
+#[tokio::test]
+async fn slow_optional_probe_cannot_delay_metrics_publication() {
+    let server = MockServer::start_async().await;
+    server
+        .mock_async(|when, then| {
+            when.method(GET).path("/metrics");
+            then.status(200).body(FIXTURE);
+        })
+        .await;
+    server
+        .mock_async(|when, then| {
+            when.method(GET).path("/health");
+            then.status(200).delay(Duration::from_secs(2));
+        })
+        .await;
+
+    let config = config_for(&[server.base_url()]);
+    let (tx, mut rx) = mpsc::channel(64);
+    let _control = spawn_all(&config, tx);
+    let _started = next_metrics_started_for(&mut rx, 0).await;
+    let outcome = tokio::time::timeout(Duration::from_millis(500), next_scrape_for(&mut rx, 0))
+        .await
+        .expect("slow /health delayed /metrics publication");
+    assert!(outcome.result.is_ok(), "{outcome:?}");
+}
+
+#[tokio::test]
+async fn first_metrics_attempts_use_fixed_quarter_second_fleet_phases() {
+    let server = MockServer::start_async().await;
+    server
+        .mock_async(|when, then| {
+            when.method(GET).path("/metrics");
+            then.status(200).body(FIXTURE);
+        })
+        .await;
+    let urls = vec![server.base_url(); 4];
+    let config = config_for(&urls);
+    let (tx, mut rx) = mpsc::channel(64);
+    let _control = spawn_all(&config, tx);
+
+    let starts = tokio::time::timeout(Duration::from_secs(2), async {
+        let mut starts = [None; 4];
+        while starts.iter().any(Option::is_none) {
+            if let Some(AppEvent::MetricsStarted { endpoint, at }) = rx.recv().await
+                && endpoint < starts.len()
+                && starts[endpoint].is_none()
+            {
+                starts[endpoint] = Some(at);
+            }
+        }
+        starts.map(Option::unwrap)
+    })
+    .await
+    .expect("fleet did not start all first attempts");
+
+    for (idx, expected_ms) in [0_u64, 250, 500, 750].into_iter().enumerate() {
+        let actual = starts[idx].duration_since(starts[0]);
+        let expected = Duration::from_millis(expected_ms);
+        assert!(
+            actual.abs_diff(expected) <= Duration::from_millis(200),
+            "endpoint {idx}: expected {expected:?}, got {actual:?}"
+        );
+    }
 }
 
 #[test]

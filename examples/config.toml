@@ -1,0 +1,46 @@
+# vllmtop configuration
+#
+# Default location: ~/.config/vllmtop/config.toml
+# (or $XDG_CONFIG_HOME/vllmtop/config.toml when XDG_CONFIG_HOME is set)
+# Explicit path: vllmtop --config /path/to/config.toml
+#
+# Precedence: built-in defaults < this file < command-line flags.
+# `--endpoint` on the command line REPLACES the whole [[endpoints]] list.
+#
+# SECRETS ARE NEVER STORED HERE. Fields ending in `_env` name environment
+# variables whose values are read at startup. If a named variable is unset,
+# only that endpoint is disabled (with a clear error); others keep working.
+
+# How often to poll each endpoint, in milliseconds (1000..=60000).
+refresh_interval_ms = 1000
+
+# How much in-memory history to keep for charts, in seconds (30..=86400).
+history_seconds = 300
+
+# Rolling window for latency percentile estimates, in seconds (5..=3600).
+percentile_window_seconds = 60
+
+# Days of history kept in the SQLite database when running with --record.
+retention_days = 30
+
+# --- Endpoints ------------------------------------------------------------
+# With no [[endpoints]] and no --endpoint flags, vllmtop monitors
+# http://127.0.0.1:8000 under the name "local".
+
+[[endpoints]]
+name = "local"
+url = "http://127.0.0.1:8000"
+
+[[endpoints]]
+name = "spark-a"
+url = "http://10.0.0.21:8000"
+# Sends "Authorization: Bearer <value of $SPARK_A_VLLM_TOKEN>".
+bearer_token_env = "SPARK_A_VLLM_TOKEN"
+
+# Extra headers, values also resolved from the environment.
+[endpoints.header_env]
+"X-Custom-Auth" = "SPARK_A_CUSTOM_AUTH"
+
+[[endpoints]]
+# name is optional: this endpoint displays as "10.0.0.22:8443".
+url = "https://10.0.0.22:8443"

@@ -116,14 +116,17 @@ pub struct EndpointState {
     pub served_models: Vec<String>,
     /// `/health` result: None = never checked / unknown.
     pub healthy: Option<bool>,
+    /// Monotonic start time of the most recent `/metrics` attempt.
+    pub last_attempt_at: Option<Instant>,
+    /// Present only while that endpoint's non-overlapping `/metrics` request
+    /// is in flight.
+    pub scraping_since: Option<Instant>,
     pub last_ok_at: Option<Instant>,
     pub last_ok_wall: Option<SystemTime>,
     pub last_scrape_duration: Option<Duration>,
     pub total_scrapes: u64,
     pub total_failures: u64,
     pub parse_issue_count: usize,
-    /// Last good raw scrape, preserved while stale.
-    pub raw: Option<ScrapeText>,
     /// Last good curated extraction, preserved while stale.
     pub curated: Option<CuratedScrape>,
     pub derived: BTreeMap<SeriesKey, DerivedSeries>,
@@ -152,13 +155,14 @@ impl EndpointState {
             vllm_version: None,
             served_models: Vec::new(),
             healthy: None,
+            last_attempt_at: None,
+            scraping_since: None,
             last_ok_at: None,
             last_ok_wall: None,
             last_scrape_duration: None,
             total_scrapes: 0,
             total_failures: 0,
             parse_issue_count: 0,
-            raw: None,
             curated: None,
             derived: BTreeMap::new(),
             restart_seen_at: None,
@@ -187,6 +191,7 @@ impl EndpointState {
 
     /// Apply one scrape outcome.
     pub fn apply(&mut self, outcome: ScrapeOutcome) {
+        self.scraping_since = None;
         self.total_scrapes += 1;
         match outcome.result {
             Err(error) => {
@@ -218,6 +223,28 @@ impl EndpointState {
                     self.ingest_metrics(text, outcome.at);
                 }
             }
+        }
+    }
+
+    pub fn mark_attempt_started(&mut self, at: Instant) {
+        self.last_attempt_at = Some(at);
+        self.scraping_since = Some(at);
+    }
+
+    pub fn apply_optional(
+        &mut self,
+        healthy: Option<bool>,
+        version: Option<String>,
+        models: Option<Vec<String>>,
+    ) {
+        if let Some(healthy) = healthy {
+            self.healthy = Some(healthy);
+        }
+        if let Some(version) = version {
+            self.vllm_version = Some(version);
+        }
+        if let Some(models) = models {
+            self.served_models = models;
         }
     }
 
@@ -316,7 +343,6 @@ impl EndpointState {
 
         self.derived = derived;
         self.curated = Some(curated);
-        self.raw = Some(text);
 
         // Record history points from the same rows the recorder sees.
         let window = self.history_window;
@@ -647,6 +673,21 @@ vllm:request_success_total{{engine="0",finished_reason="error",model_name="m"}} 
             e.freshness(base + Duration::from_secs(30), interval),
             Freshness::Stale
         );
+    }
+
+    #[test]
+    fn attempt_state_distinguishes_in_flight_from_last_success() {
+        let base = Instant::now();
+        let mut e = ep();
+        e.mark_attempt_started(base);
+        assert_eq!(e.last_attempt_at, Some(base));
+        assert_eq!(e.scraping_since, Some(base));
+        assert_eq!(e.last_ok_at, None);
+
+        e.apply(scrape(base, 2.0, &metrics_text(1.0, 1.0, 1.0, 0.0)));
+        assert_eq!(e.scraping_since, None);
+        assert_eq!(e.last_attempt_at, Some(base));
+        assert_eq!(e.last_ok_at, Some(base + Duration::from_secs(2)));
     }
 
     #[test]

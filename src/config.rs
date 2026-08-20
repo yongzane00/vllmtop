@@ -29,7 +29,9 @@ pub const DEFAULT_HISTORY_SECS: u64 = 300;
 pub const DEFAULT_PERCENTILE_WINDOW_SECS: u64 = 60;
 pub const DEFAULT_RETENTION_DAYS: u32 = 30;
 
-pub const MIN_REFRESH_MS: u64 = 250;
+/// The minimum target *start* cadence. Faster settings would collapse the
+/// fixed 0/250/500/750 ms fleet phases and overload monitored servers.
+pub const MIN_REFRESH_MS: u64 = 1_000;
 pub const MAX_REFRESH_MS: u64 = 60_000;
 
 #[derive(Debug, thiserror::Error)]
@@ -505,6 +507,25 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn one_second_is_the_minimum_target_start_cadence() {
+        let err = load(&cli(&["--refresh-interval-ms", "999"]), no_env).unwrap_err();
+        assert!(matches!(
+            err,
+            ConfigError::OutOfRange {
+                field: "refresh_interval_ms",
+                min: 1_000,
+                ..
+            }
+        ));
+        assert_eq!(
+            load(&cli(&["--refresh-interval-ms", "1000"]), no_env)
+                .unwrap()
+                .refresh_interval,
+            Duration::from_secs(1)
+        );
+    }
+
     fn write_config(dir: &Path, text: &str) -> PathBuf {
         let path = dir.join("config.toml");
         let mut f = std::fs::File::create(&path).unwrap();
@@ -547,11 +568,11 @@ url = "https://10.0.0.22:8443"
 
         // CLI wins over the file.
         let cfg = load(
-            &cli(&["--config", path_str, "--refresh-interval-ms", "500"]),
+            &cli(&["--config", path_str, "--refresh-interval-ms", "1500"]),
             no_env,
         )
         .unwrap();
-        assert_eq!(cfg.refresh_interval, Duration::from_millis(500));
+        assert_eq!(cfg.refresh_interval, Duration::from_millis(1500));
 
         // CLI endpoints REPLACE file endpoints.
         let cfg = load(

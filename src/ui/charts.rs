@@ -1,14 +1,14 @@
-//! H: rolling history charts, filterable by endpoint and model/engine series.
+//! Rolling history charts: the grid embedded below the fleet table, plus the
+//! single-endpoint trend charts used by the endpoint detail view.
 
 use ratatui::Frame;
-use ratatui::layout::{Constraint, Layout, Rect};
+use ratatui::layout::{Constraint, Rect};
 use ratatui::symbols::Marker;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Axis, Block, Borders, Chart, Dataset, GraphType, Paragraph};
 use std::time::Instant;
 
 use crate::app::App;
-use crate::metrics::normalize::SeriesKey;
 use crate::state::{EndpointState, series_id};
 use crate::ui::format;
 
@@ -52,17 +52,15 @@ impl ValueKind {
     }
 }
 
-pub fn draw(frame: &mut Frame, app: &App, area: Rect) {
-    let [filter_area, grid] =
-        Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).areas(area);
-    draw_filter_line(frame, app, filter_area);
-
+/// Draw the scrollable chart grid (all endpoints overlaid, one colored line
+/// per endpoint/series).
+pub fn draw_grid(frame: &mut Frame, app: &App, area: Rect, scroll: usize) {
     // 2-column grid of charts; each chart needs ~8 rows to be readable.
     let chart_h = 8u16;
-    let cols = if grid.width >= 100 { 2 } else { 1 };
-    let visible_rows = (grid.height / chart_h).max(1) as usize;
+    let cols = if area.width >= 100 { 2 } else { 1 };
+    let visible_rows = (area.height / chart_h).max(1) as usize;
     let total_rows = CHARTS.len().div_ceil(cols);
-    let scroll = app.hist.scroll.min(total_rows.saturating_sub(visible_rows));
+    let scroll = scroll.min(total_rows.saturating_sub(visible_rows));
 
     for vis_row in 0..visible_rows {
         let row = vis_row + scroll;
@@ -74,54 +72,16 @@ pub fn draw(frame: &mut Frame, app: &App, area: Rect) {
             let Some(&(id, title, kind)) = CHARTS.get(idx) else {
                 continue;
             };
-            let w = grid.width / cols as u16;
+            let w = area.width / cols as u16;
             let cell = Rect {
-                x: grid.x + col as u16 * w,
-                y: grid.y + vis_row as u16 * chart_h,
+                x: area.x + col as u16 * w,
+                y: area.y + vis_row as u16 * chart_h,
                 width: w,
-                height: chart_h.min(grid.height - vis_row as u16 * chart_h),
+                height: chart_h.min(area.height - vis_row as u16 * chart_h),
             };
             draw_metric_chart(frame, app, cell, title, id, kind);
         }
     }
-}
-
-fn draw_filter_line(frame: &mut Frame, app: &App, area: Rect) {
-    let t = &app.theme;
-    let endpoint = match app.hist.endpoint_filter {
-        None => "ALL".to_string(),
-        Some(i) => app
-            .endpoints
-            .get(i)
-            .map(|e| e.name.clone())
-            .unwrap_or_default(),
-    };
-    let series = app.observed_series();
-    let model = match app.hist.model_filter.and_then(|i| series.get(i)) {
-        None => "ALL".to_string(),
-        Some(k) => k.display(),
-    };
-    let line = Line::from(vec![
-        Span::styled(" HISTORY ", t.heading),
-        Span::styled("endpoint(e): ", t.dim),
-        Span::styled(endpoint, t.value),
-        Span::styled("   series(m): ", t.dim),
-        Span::styled(model, t.value),
-        Span::styled(
-            format!(
-                "   window {}   scroll j/k",
-                format::brief_duration(app.config.history_window)
-            ),
-            t.dim,
-        ),
-    ]);
-    frame.render_widget(Paragraph::new(line), area);
-}
-
-/// Which series key filter applies (History view only).
-fn active_series_filter(app: &App) -> Option<SeriesKey> {
-    let series = app.observed_series();
-    app.hist.model_filter.and_then(|i| series.get(i).cloned())
 }
 
 /// `(seconds relative to now, value)` chart points for one plotted line.
@@ -137,24 +97,13 @@ fn draw_metric_chart(
 ) {
     let now = Instant::now();
     let window = app.config.history_window.as_secs_f64();
-    let series_filter = active_series_filter(app);
 
     // One dataset per (endpoint, model/engine series): merging different
     // series into one line would draw a meaningless sawtooth.
     let mut plotted: Vec<(usize, LinePoints, Option<f64>)> = Vec::new();
     for (i, e) in app.endpoints.iter().enumerate() {
-        if let Some(filter) = app.hist.endpoint_filter
-            && filter != i
-        {
-            continue;
-        }
-        for ((key, sid), ring) in &e.history {
+        for ((_key, sid), ring) in &e.history {
             if *sid != id {
-                continue;
-            }
-            if let Some(f) = &series_filter
-                && key != f
-            {
                 continue;
             }
             let points: LinePoints = ring
@@ -347,7 +296,7 @@ pub fn draw_single_chart(
             Axis::default()
                 .bounds([-window, 0.0])
                 .labels(vec![
-                    Span::styled(format!("-{:.0}s", window), t.dim),
+                    Span::styled(format!("-{window:.0}s"), t.dim),
                     Span::styled("now", t.dim),
                 ])
                 .style(t.dim),

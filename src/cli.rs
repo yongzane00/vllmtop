@@ -28,7 +28,7 @@ pub struct Cli {
     #[arg(long, value_name = "PATH")]
     pub record: Option<PathBuf>,
 
-    /// Refresh interval in milliseconds (min 250, max 60000).
+    /// Refresh interval in milliseconds (min 1000, max 60000).
     #[arg(long, value_name = "MS")]
     pub refresh_interval_ms: Option<u64>,
 

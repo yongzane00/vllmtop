@@ -1,12 +1,12 @@
 //! Per-endpoint polling tasks.
 //!
-//! Each configured endpoint gets one independent tokio task that:
-//! - GETs `/metrics` (required) and `/health` (optional) every cycle, and
-//!   `/version` + `/v1/models` occasionally (they change rarely);
+//! Each configured endpoint gets independent tokio tasks that:
+//! - start non-overlapping `/metrics` requests on an anchored cadence;
+//! - skip cadence slots missed by a slow request instead of catching up;
+//! - use fixed quarter-second fleet phase offsets instead of random jitter;
+//! - probe `/health`, `/version`, and `/v1/models` independently;
 //! - parses the exposition text off the UI path;
 //! - reports a [`ScrapeOutcome`] over one shared bounded channel;
-//! - on failure, backs off exponentially (capped) with jitter so a fleet of
-//!   failing endpoints never produces synchronized retry storms;
 //! - never blocks or crashes any other endpoint's collection.
 //!
 //! Auth material resolved from the environment lives only inside the
@@ -33,8 +33,25 @@ pub const MAX_METADATA_BODY_BYTES: usize = 256 * 1024;
 /// Fetch `/version` and `/v1/models` every N cycles.
 const METADATA_EVERY_CYCLES: u64 = 30;
 
-/// Ceiling for failure backoff.
-const MAX_BACKOFF: Duration = Duration::from_secs(30);
+/// Fleet-wide deterministic staggering. Endpoints after the fourth reuse the
+/// four quarter-second slots rather than introducing per-cycle randomness.
+const PHASE_STEP: Duration = Duration::from_millis(250);
+const PHASE_SLOTS: usize = 4;
+
+fn phase_offset(endpoint_index: usize) -> Duration {
+    PHASE_STEP * (endpoint_index % PHASE_SLOTS) as u32
+}
+
+/// Return the first cadence slot strictly after `now`. Advancing from the
+/// original anchor keeps starts phase-aligned; looping skips every slot that a
+/// slow request occupied instead of queueing catch-up work.
+fn next_slot_strictly_after(anchor: Instant, cadence: Duration, now: Instant) -> Instant {
+    let mut next = anchor;
+    while next <= now {
+        next += cadence;
+    }
+    next
+}
 
 /// Handles for steering running collectors.
 pub struct CollectorControl {
@@ -68,6 +85,7 @@ impl CollectorControl {
 pub fn spawn_all(config: &Config, events: mpsc::Sender<AppEvent>) -> CollectorControl {
     let (interval_tx, _) = watch::channel(config.refresh_interval);
     let (force_tx, _) = watch::channel(0u64);
+    let fleet_anchor = Instant::now();
 
     for (idx, endpoint) in config.endpoints.iter().enumerate() {
         let task = CollectorTask::new(
@@ -76,8 +94,19 @@ pub fn spawn_all(config: &Config, events: mpsc::Sender<AppEvent>) -> CollectorCo
             events.clone(),
             interval_tx.subscribe(),
             force_tx.subscribe(),
+            fleet_anchor + phase_offset(idx),
         );
+        let optional = OptionalTask {
+            idx,
+            endpoint: endpoint.clone(),
+            events: events.clone(),
+            client: task.client.clone(),
+            cadence: config.refresh_interval,
+            first_start: fleet_anchor + phase_offset(idx) + Duration::from_millis(125),
+            cycle: 0,
+        };
         tokio::spawn(task.run());
+        tokio::spawn(optional.run());
     }
 
     CollectorControl {
@@ -95,8 +124,7 @@ struct CollectorTask {
     /// Client is None when auth env resolution failed; `auth_error` says why.
     client: Option<reqwest::Client>,
     auth_error: Option<String>,
-    cycle: u64,
-    consecutive_failures: u32,
+    first_start: Instant,
 }
 
 impl CollectorTask {
@@ -106,6 +134,7 @@ impl CollectorTask {
         events: mpsc::Sender<AppEvent>,
         interval_rx: watch::Receiver<Duration>,
         force_rx: watch::Receiver<u64>,
+        first_start: Instant,
     ) -> Self {
         let (client, auth_error) = match build_client(&endpoint) {
             Ok(client) => (Some(client), None),
@@ -119,15 +148,29 @@ impl CollectorTask {
             force_rx,
             client,
             auth_error,
-            cycle: 0,
-            consecutive_failures: 0,
+            first_start,
         }
     }
 
     async fn run(mut self) {
+        let mut next_start = self.first_start;
         loop {
+            if !self.wait_for_start(&mut next_start).await {
+                return;
+            }
+            let started = Instant::now();
+            if self
+                .events
+                .send(AppEvent::MetricsStarted {
+                    endpoint: self.idx,
+                    at: started,
+                })
+                .await
+                .is_err()
+            {
+                return;
+            }
             let outcome = self.poll_once().await;
-            let failed = outcome.result.is_err();
             if self
                 .events
                 .send(AppEvent::Scrape {
@@ -139,13 +182,8 @@ impl CollectorTask {
             {
                 return; // main loop is gone; shut down quietly
             }
-            self.consecutive_failures = if failed {
-                self.consecutive_failures.saturating_add(1)
-            } else {
-                0
-            };
-            self.sleep_until_next().await;
-            self.cycle += 1;
+            let cadence = *self.interval_rx.borrow_and_update();
+            next_start = next_slot_strictly_after(next_start, cadence, Instant::now());
         }
     }
 
@@ -163,18 +201,13 @@ impl CollectorTask {
             };
         };
 
-        let want_metadata = self.cycle.is_multiple_of(METADATA_EVERY_CYCLES);
         let started = Instant::now();
-
-        // /metrics and /health in parallel; /metrics decides success.
-        let metrics_fut = fetch_metrics(&client, &self.endpoint);
-        let health_fut = fetch_health(&client, &self.endpoint);
-        let (metrics, healthy) = tokio::join!(metrics_fut, health_fut);
+        let metrics = fetch_metrics(&client, &self.endpoint).await;
         let duration = started.elapsed();
 
         let mut payload = ScrapePayload {
             metrics: None,
-            healthy,
+            healthy: None,
             version: None,
             models: None,
         };
@@ -182,10 +215,6 @@ impl CollectorTask {
         let result = match metrics {
             Ok(text) => {
                 payload.metrics = Some(parse_text(&text));
-                if want_metadata {
-                    payload.version = fetch_version(&client, &self.endpoint).await;
-                    payload.models = fetch_models(&client, &self.endpoint).await;
-                }
                 Ok(payload)
             }
             Err(e) => Err(e),
@@ -199,56 +228,81 @@ impl CollectorTask {
         }
     }
 
-    /// Sleep for the interval (or backoff after failures) with jitter.
-    /// A force-refresh ends the sleep immediately (explicit user action);
-    /// an interval change merely RESTARTS the sleep with the new value —
-    /// it must never trigger an immediate fleet-wide poll or cancel backoff.
-    async fn sleep_until_next(&mut self) {
+    /// Wait for the next anchored slot. Force-refresh may start early while
+    /// idle; interval changes reset the fleet's fixed phase from change time.
+    async fn wait_for_start(&mut self, next_start: &mut Instant) -> bool {
         loop {
-            // borrow_and_update marks pending notifications as seen, so a
-            // change that arrived during the poll doesn't wake us instantly.
-            let base = *self.interval_rx.borrow_and_update();
-            let delay = if self.consecutive_failures == 0 {
-                base
-            } else {
-                // Exponential backoff capped at MAX_BACKOFF, never below base.
-                let shift = self.consecutive_failures.min(6);
-                (base * 2u32.saturating_pow(shift))
-                    .min(MAX_BACKOFF)
-                    .max(base)
-            };
-            let delay = with_jitter(delay, self.idx as u64 + self.cycle);
-
             tokio::select! {
-                _ = tokio::time::sleep(delay) => return,
+                _ = tokio::time::sleep_until((*next_start).into()) => return true,
                 res = self.force_rx.changed() => {
                     if res.is_ok() {
-                        return; // user asked for an immediate refresh
+                        self.force_rx.borrow_and_update();
+                        return true; // user asked for an immediate refresh
                     }
-                    // Control dropped: keep polling at the plain interval.
-                    tokio::time::sleep(delay).await;
-                    return;
+                    tokio::time::sleep_until((*next_start).into()).await;
+                    return true;
                 }
                 res = self.interval_rx.changed() => {
                     if res.is_err() {
-                        tokio::time::sleep(delay).await;
-                        return;
+                        tokio::time::sleep_until((*next_start).into()).await;
+                        return true;
                     }
-                    // Interval changed: loop and re-sleep with the new value.
+                    self.interval_rx.borrow_and_update();
+                    *next_start = Instant::now() + phase_offset(self.idx);
                 }
             }
         }
     }
 }
 
-/// ±10% deterministic-entropy jitter, no `rand` dependency needed.
-fn with_jitter(base: Duration, salt: u64) -> Duration {
-    use std::hash::{BuildHasher, RandomState};
-    let h = RandomState::new().hash_one(salt);
-    let frac = (h % 2001) as i64 - 1000; // -1000..=1000
-    let base_ns = base.as_nanos() as i64;
-    let jitter_ns = base_ns / 10 * frac / 1000;
-    Duration::from_nanos((base_ns + jitter_ns).max(0) as u64)
+/// Optional probes have their own sequential schedule and client handle, so
+/// none of them can hold up `/metrics` publication. They may overlap metrics,
+/// but optional cycles cannot overlap one another or queue missed ticks.
+struct OptionalTask {
+    idx: usize,
+    endpoint: EndpointConfig,
+    events: mpsc::Sender<AppEvent>,
+    client: Option<reqwest::Client>,
+    cadence: Duration,
+    first_start: Instant,
+    cycle: u64,
+}
+
+impl OptionalTask {
+    async fn run(mut self) {
+        let Some(client) = self.client.take() else {
+            return;
+        };
+        let mut next_start = self.first_start;
+        loop {
+            tokio::time::sleep_until(next_start.into()).await;
+            let want_metadata = self.cycle.is_multiple_of(METADATA_EVERY_CYCLES);
+            let (healthy, version, models) = if want_metadata {
+                tokio::join!(
+                    fetch_health(&client, &self.endpoint),
+                    fetch_version(&client, &self.endpoint),
+                    fetch_models(&client, &self.endpoint),
+                )
+            } else {
+                (fetch_health(&client, &self.endpoint).await, None, None)
+            };
+            if self
+                .events
+                .send(AppEvent::OptionalUpdate {
+                    endpoint: self.idx,
+                    healthy,
+                    version,
+                    models,
+                })
+                .await
+                .is_err()
+            {
+                return;
+            }
+            self.cycle = self.cycle.wrapping_add(1);
+            next_start = next_slot_strictly_after(next_start, self.cadence, Instant::now());
+        }
+    }
 }
 
 /// Build a reqwest client with resolved auth headers. The only place secret
@@ -457,13 +511,29 @@ mod tests {
     }
 
     #[test]
-    fn jitter_stays_within_ten_percent() {
-        let base = Duration::from_millis(1000);
-        for salt in 0..200 {
-            let d = with_jitter(base, salt);
-            assert!(d >= Duration::from_millis(900), "{d:?}");
-            assert!(d <= Duration::from_millis(1100), "{d:?}");
+    fn fleet_phase_offsets_repeat_in_four_quarter_second_slots() {
+        let expected_ms = [0, 250, 500, 750, 0, 250, 500, 750];
+        for (idx, expected) in expected_ms.into_iter().enumerate() {
+            assert_eq!(phase_offset(idx), Duration::from_millis(expected));
         }
+    }
+
+    #[test]
+    fn anchored_scheduler_skips_every_slot_missed_by_a_slow_scrape() {
+        let anchor = Instant::now();
+        let cadence = Duration::from_secs(1);
+        assert_eq!(
+            next_slot_strictly_after(anchor, cadence, anchor + Duration::from_millis(200)),
+            anchor + Duration::from_secs(1)
+        );
+        assert_eq!(
+            next_slot_strictly_after(anchor, cadence, anchor + Duration::from_millis(2_300)),
+            anchor + Duration::from_secs(3)
+        );
+        assert_eq!(
+            next_slot_strictly_after(anchor, cadence, anchor + Duration::from_secs(3)),
+            anchor + Duration::from_secs(4)
+        );
     }
 
     #[test]

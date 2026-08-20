@@ -1,4 +1,5 @@
-//! Tab 1: fleet overview — all endpoints in one dense table plus totals.
+//! Tab 1: fleet overview — totals, the endpoint table, and the rolling
+//! history charts in one view (PgUp/PgDn scrolls the chart grid).
 
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
@@ -10,11 +11,28 @@ use crate::app::App;
 use crate::state::{Freshness, KvAggregate, aggregate_kv};
 use crate::ui::{format, freshness_badge};
 
+/// A chart row needs this many terminal rows to be readable; below that the
+/// charts section is dropped and the table gets everything.
+const MIN_CHART_ROWS: u16 = 8;
+
 pub fn draw(frame: &mut Frame, app: &App, area: Rect) {
-    let [summary_area, table_area] =
+    let [summary_area, rest] =
         Layout::vertical([Constraint::Length(4), Constraint::Min(0)]).areas(area);
     draw_summary(frame, app, summary_area);
-    draw_table(frame, app, table_area);
+
+    // Table gets exactly what it needs (header + one row per endpoint, at
+    // most half the space); the history charts take the remainder when at
+    // least one chart row fits.
+    let table_needed = (app.endpoints.len() as u16).saturating_add(1);
+    let table_h = table_needed.min((rest.height / 2).max(1));
+    if rest.height.saturating_sub(table_h) >= MIN_CHART_ROWS {
+        let [table_area, charts_area] =
+            Layout::vertical([Constraint::Length(table_h), Constraint::Min(0)]).areas(rest);
+        draw_table(frame, app, table_area);
+        super::charts::draw_grid(frame, app, charts_area, app.fleet_chart_scroll);
+    } else {
+        draw_table(frame, app, rest);
+    }
 }
 
 fn draw_summary(frame: &mut Frame, app: &App, area: Rect) {

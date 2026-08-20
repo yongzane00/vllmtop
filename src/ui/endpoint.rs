@@ -8,7 +8,7 @@ use std::time::Instant;
 
 use crate::app::App;
 use crate::metrics::normalize::{CuratedSeries, SeriesKey, hist};
-use crate::state::{DerivedSeries, EndpointState, Freshness};
+use crate::state::{DerivedSeries, EndpointState};
 use crate::ui::{format, freshness_badge};
 
 pub fn draw(frame: &mut Frame, app: &App, index: usize, area: Rect) {
@@ -52,15 +52,10 @@ fn draw_head(frame: &mut Frame, app: &App, e: &EndpointState, area: Rect) {
     }
 
     let mut line2 = vec![
-        Span::styled("   scraped ", t.dim),
-        Span::styled(
-            format::ago(e.last_ok_at, now),
-            if freshness == Freshness::Stale {
-                t.crit
-            } else {
-                t.text
-            },
-        ),
+        Span::styled("   success ", t.dim),
+        Span::styled(format::ago(e.last_ok_at, now), t.text),
+        Span::styled("  ", t.dim),
+        Span::styled(attempt_status(e, now), t.secondary),
         Span::styled("  in ", t.dim),
         Span::styled(
             e.last_scrape_duration
@@ -68,8 +63,6 @@ fn draw_head(frame: &mut Frame, app: &App, e: &EndpointState, area: Rect) {
                 .unwrap_or_else(|| format::NA.into()),
             t.text,
         ),
-        Span::styled("  scrapes ", t.dim),
-        Span::styled(format!("{}", e.total_scrapes), t.text),
         Span::styled("  failures ", t.dim),
         Span::styled(
             format!("{}", e.total_failures),
@@ -101,6 +94,22 @@ fn draw_head(frame: &mut Frame, app: &App, e: &EndpointState, area: Rect) {
             .block(Block::new().borders(Borders::BOTTOM).border_style(t.dim)),
         area,
     );
+}
+
+fn attempt_status(endpoint: &EndpointState, now: Instant) -> String {
+    if let Some(started) = endpoint.scraping_since {
+        return format!(
+            "scraping {}",
+            format::brief_duration(now.saturating_duration_since(started))
+        );
+    }
+    match endpoint.last_attempt_at {
+        Some(started) => format!(
+            "attempt {} ago",
+            format::brief_duration(now.saturating_duration_since(started))
+        ),
+        None => "attempt never".into(),
+    }
 }
 
 fn draw_tables(frame: &mut Frame, app: &App, e: &EndpointState, area: Rect) {
@@ -380,7 +389,7 @@ fn draw_latency(frame: &mut Frame, app: &App, e: &EndpointState, area: Rect) {
 /// Bottom charts: recent trends for generation throughput and queue depth.
 fn draw_trends(frame: &mut Frame, app: &App, e: &EndpointState, area: Rect) {
     let [left, right] = Layout::horizontal([Constraint::Percentage(50); 2]).areas(area);
-    super::history::draw_single_chart(
+    super::charts::draw_single_chart(
         frame,
         app,
         left,
@@ -388,7 +397,7 @@ fn draw_trends(frame: &mut Frame, app: &App, e: &EndpointState, area: Rect) {
         &[crate::state::series_id::GENERATION_TPS],
         Some(e),
     );
-    super::history::draw_single_chart(
+    super::charts::draw_single_chart(
         frame,
         app,
         right,
@@ -399,4 +408,26 @@ fn draw_trends(frame: &mut Frame, app: &App, e: &EndpointState, area: Rect) {
         ],
         Some(e),
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    #[test]
+    fn attempt_status_distinguishes_idle_and_scraping() {
+        let now = Instant::now();
+        let mut endpoint = EndpointState::new(
+            "ep".into(),
+            "http://example.test".into(),
+            Duration::from_secs(60),
+            Duration::from_secs(60),
+        );
+        assert_eq!(attempt_status(&endpoint, now), "attempt never");
+        endpoint.mark_attempt_started(now - Duration::from_millis(300));
+        assert!(attempt_status(&endpoint, now).starts_with("scraping "));
+        endpoint.scraping_since = None;
+        assert_eq!(attempt_status(&endpoint, now), "attempt 0.3s ago");
+    }
 }

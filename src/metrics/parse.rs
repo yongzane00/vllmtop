@@ -477,6 +477,20 @@ value_missing{a=\"b\"}
     }
 
     #[test]
+    fn malformed_line_diagnostics_are_counted_but_storage_is_capped() {
+        let text = "bad\n".repeat(100_000);
+        let scrape = parse_text(&text);
+        assert_eq!(scrape.issue_count, 100_000);
+        assert_eq!(scrape.issues.len(), MAX_PARSE_ISSUES);
+        assert!(
+            scrape
+                .issues
+                .iter()
+                .all(|issue| issue.message.len() <= MAX_ISSUE_MESSAGE_BYTES)
+        );
+    }
+
+    #[test]
     fn openmetrics_eof_and_plain_comments_ignored() {
         let scrape = parse_text("# just a comment\nm 1\n# EOF\n");
         assert!(scrape.issues.is_empty());

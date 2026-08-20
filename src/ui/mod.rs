@@ -1,11 +1,10 @@
 //! Rendering. Pure functions from `&App` to the frame — no state mutation.
 
+pub mod charts;
 pub mod endpoint;
 pub mod fleet;
 pub mod format;
 pub mod help;
-pub mod history;
-pub mod raw;
 pub mod theme;
 
 use ratatui::Frame;
@@ -33,8 +32,6 @@ pub fn draw(frame: &mut Frame, app: &App) {
     match app.view {
         View::Fleet => fleet::draw(frame, app, body),
         View::Endpoint(i) => endpoint::draw(frame, app, i, body),
-        View::History => history::draw(frame, app, body),
-        View::Raw => raw::draw(frame, app, body),
     }
     draw_footer(frame, app, footer);
 
@@ -50,7 +47,7 @@ fn draw_header(frame: &mut Frame, app: &App, area: Rect) {
         Span::styled("│ ", t.dim),
     ];
 
-    // Tab strip: 1:ALL 2:<name> … H:HIST R:RAW.
+    // Tab strip: 1:ALL 2:<name> …
     let tab = |label: String, active: bool| -> Span<'static> {
         let style = if active { t.tab_active } else { t.tab_inactive };
         Span::styled(format!(" {label} "), style)
@@ -64,8 +61,6 @@ fn draw_header(frame: &mut Frame, app: &App, area: Rect) {
         };
         spans.push(tab(label, app.view == View::Endpoint(i)));
     }
-    spans.push(tab("H:HIST".into(), app.view == View::History));
-    spans.push(tab("R:RAW".into(), app.view == View::Raw));
 
     // Right side: pause / interval / recording status.
     let mut right: Vec<Span> = Vec::new();
@@ -97,50 +92,28 @@ fn draw_header(frame: &mut Frame, app: &App, area: Rect) {
 
 fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
     let t = &app.theme;
-    let pairs: Vec<(&str, &str)> = if app.raw.editing {
-        vec![("type", "filter"), ("Enter", "apply"), ("Esc", "clear")]
-    } else {
-        match app.view {
-            View::Fleet => vec![
-                ("q", "quit"),
-                ("Tab", "views"),
-                ("j/k", "select"),
-                ("Enter", "open"),
-                ("s", app.fleet_sort.label()),
-                ("r", "refresh"),
-                ("p", "pause"),
-                ("+/-", "interval"),
-                ("?", "help"),
-            ],
-            View::Endpoint(_) => vec![
-                ("q", "quit"),
-                ("Tab", "views"),
-                ("1", "fleet"),
-                ("H", "history"),
-                ("R", "raw"),
-                ("r", "refresh"),
-                ("p", "pause"),
-                ("?", "help"),
-            ],
-            View::History => vec![
-                ("q", "quit"),
-                ("Tab", "views"),
-                ("e", "endpoint"),
-                ("m", "model"),
-                ("j/k", "scroll"),
-                ("p", "pause"),
-                ("?", "help"),
-            ],
-            View::Raw => vec![
-                ("q", "quit"),
-                ("Tab", "views"),
-                ("/", "filter"),
-                ("e", "endpoint"),
-                ("j/k", "scroll"),
-                ("g/G", "top/end"),
-                ("?", "help"),
-            ],
-        }
+    let pairs: Vec<(&str, &str)> = match app.view {
+        View::Fleet => vec![
+            ("q", "quit"),
+            ("Tab", "views"),
+            ("j/k", "select"),
+            ("Enter", "open"),
+            ("PgUp/PgDn", "charts"),
+            ("s", app.fleet_sort.label()),
+            ("r", "refresh"),
+            ("p", "pause"),
+            ("+/-", "interval"),
+            ("?", "help"),
+        ],
+        View::Endpoint(_) => vec![
+            ("q", "quit"),
+            ("Tab", "views"),
+            ("1", "fleet"),
+            ("r", "refresh"),
+            ("p", "pause"),
+            ("+/-", "interval"),
+            ("?", "help"),
+        ],
     };
     let mut spans: Vec<Span> = vec![Span::raw(" ")];
     for (keycap, action) in pairs {
