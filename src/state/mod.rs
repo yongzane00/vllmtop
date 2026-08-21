@@ -130,6 +130,11 @@ pub struct EndpointState {
     /// Last good curated extraction, preserved while stale.
     pub curated: Option<CuratedScrape>,
     pub derived: BTreeMap<SeriesKey, DerivedSeries>,
+    /// Session peaks of the endpoint-aggregate token rates, reset when the
+    /// monitored server restarts (a peak from before a restart would be a
+    /// stale brag).
+    pub peak_generation_tps: Option<f64>,
+    pub peak_prompt_tps: Option<f64>,
     /// Set when a counter reset was seen (vLLM restart); cleared after display.
     pub restart_seen_at: Option<Instant>,
     /// Rolling history per (series, metric id).
@@ -165,6 +170,8 @@ impl EndpointState {
             parse_issue_count: 0,
             curated: None,
             derived: BTreeMap::new(),
+            peak_generation_tps: None,
+            peak_prompt_tps: None,
             restart_seen_at: None,
             history: HashMap::new(),
             counters: CounterBank::new(),
@@ -219,7 +226,7 @@ impl EndpointState {
                     self.last_ok_at = Some(outcome.at);
                     self.last_ok_wall = Some(outcome.wall);
                     self.last_scrape_duration = Some(outcome.duration);
-                    self.parse_issue_count = text.issues.len();
+                    self.parse_issue_count = text.issue_count;
                     self.ingest_metrics(text, outcome.at);
                 }
             }
@@ -343,6 +350,25 @@ impl EndpointState {
 
         self.derived = derived;
         self.curated = Some(curated);
+
+        // Track session peaks of the aggregate rates; a server restart
+        // invalidates earlier peaks along with everything else cumulative.
+        if self.derived.values().any(|d| d.reset_detected) {
+            self.peak_generation_tps = None;
+            self.peak_prompt_tps = None;
+        }
+        let sum_rate = |get: fn(&DerivedSeries) -> Option<f64>| -> Option<f64> {
+            self.derived
+                .values()
+                .filter_map(get)
+                .fold(None, |acc: Option<f64>, v| Some(acc.unwrap_or(0.0) + v))
+        };
+        if let Some(g) = sum_rate(|d| d.generation_tps) {
+            self.peak_generation_tps = Some(self.peak_generation_tps.map_or(g, |p| p.max(g)));
+        }
+        if let Some(p) = sum_rate(|d| d.prompt_tps) {
+            self.peak_prompt_tps = Some(self.peak_prompt_tps.map_or(p, |q| q.max(p)));
+        }
 
         // Record history points from the same rows the recorder sees.
         let window = self.history_window;
@@ -597,6 +623,26 @@ vllm:request_success_total{{engine="0",finished_reason="error",model_name="m"}} 
         // Rates recover on the next interval.
         e.apply(scrape(base, 2.0, &metrics_text(200.0, 160.0, 2.0, 0.0)));
         assert_eq!(e.derived[&key()].prompt_tps, Some(100.0));
+    }
+
+    #[test]
+    fn throughput_peaks_track_max_and_reset_on_server_restart() {
+        let base = Instant::now();
+        let mut e = ep();
+        e.apply(scrape(base, 0.0, &metrics_text(1000.0, 500.0, 10.0, 0.0)));
+        assert_eq!(e.peak_generation_tps, None); // no rate yet
+        // 200 gen tokens/s, then a slower interval: peak sticks at the max.
+        e.apply(scrape(base, 1.0, &metrics_text(1400.0, 700.0, 12.0, 0.0)));
+        e.apply(scrape(base, 2.0, &metrics_text(1450.0, 750.0, 13.0, 0.0)));
+        assert_eq!(e.peak_generation_tps, Some(200.0));
+        assert_eq!(e.peak_prompt_tps, Some(400.0));
+        // Server restart: counters fall back; stale peaks are discarded.
+        e.apply(scrape(base, 3.0, &metrics_text(10.0, 5.0, 0.0, 0.0)));
+        assert_eq!(e.peak_generation_tps, None);
+        // New peaks accumulate from the post-restart world.
+        e.apply(scrape(base, 4.0, &metrics_text(60.0, 30.0, 1.0, 0.0)));
+        assert_eq!(e.peak_generation_tps, Some(25.0));
+        assert_eq!(e.peak_prompt_tps, Some(50.0));
     }
 
     #[test]

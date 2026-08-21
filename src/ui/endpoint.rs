@@ -69,11 +69,23 @@ fn draw_pulse(frame: &mut Frame, app: &App, index: usize, e: &EndpointState, are
         format!("{} tokens/s", format::count(agg.generation_tps)),
         t.value,
     ));
+    if let Some(pk) = e.peak_generation_tps {
+        line1.push(Span::styled(
+            format!(" (pk {})", format::count(Some(pk))),
+            t.dim,
+        ));
+    }
     line1.push(Span::styled("   prompt ", t.dim));
     line1.push(Span::styled(
         format!("{} tokens/s", format::count(agg.prompt_tps)),
         t.value,
     ));
+    if let Some(pk) = e.peak_prompt_tps {
+        line1.push(Span::styled(
+            format!(" (pk {})", format::count(Some(pk))),
+            t.dim,
+        ));
+    }
     line1.push(Span::styled("   running ", t.dim));
     let max_running = app
         .config
@@ -204,25 +216,6 @@ fn draw_head(frame: &mut Frame, app: &App, e: &EndpointState, area: Rect) {
             .block(Block::new().borders(Borders::BOTTOM).border_style(t.dim)),
         area,
     );
-}
-
-/// Not currently displayed (the header shows only the failure count), but
-/// kept with its test for easy reinstatement.
-#[allow(dead_code)]
-fn attempt_status(endpoint: &EndpointState, now: Instant) -> String {
-    if let Some(started) = endpoint.scraping_since {
-        return format!(
-            "scraping {}",
-            format::brief_duration(now.saturating_duration_since(started))
-        );
-    }
-    match endpoint.last_attempt_at {
-        Some(started) => format!(
-            "attempt {} ago",
-            format::brief_duration(now.saturating_duration_since(started))
-        ),
-        None => "attempt never".into(),
-    }
 }
 
 fn draw_tables(frame: &mut Frame, app: &App, e: &EndpointState, area: Rect) {
@@ -542,26 +535,4 @@ fn draw_trends(frame: &mut Frame, app: &App, e: &EndpointState, area: Rect) {
         ],
         Some(e),
     );
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::time::Duration;
-
-    #[test]
-    fn attempt_status_distinguishes_idle_and_scraping() {
-        let now = Instant::now();
-        let mut endpoint = EndpointState::new(
-            "ep".into(),
-            "http://example.test".into(),
-            Duration::from_secs(60),
-            Duration::from_secs(60),
-        );
-        assert_eq!(attempt_status(&endpoint, now), "attempt never");
-        endpoint.mark_attempt_started(now - Duration::from_millis(300));
-        assert!(attempt_status(&endpoint, now).starts_with("scraping "));
-        endpoint.scraping_since = None;
-        assert_eq!(attempt_status(&endpoint, now), "attempt 0.3s ago");
-    }
 }

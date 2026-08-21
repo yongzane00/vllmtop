@@ -16,6 +16,14 @@ use std::collections::HashMap;
 
 use super::model::{LabelSet, MetricFamily, MetricType, ParseIssue, Sample, ScrapeText};
 
+/// A hostile or broken endpoint can make every line invalid (megabytes of
+/// them within the body cap), and issue messages can embed input tokens of
+/// arbitrary length — so issues are counted in full but stored bounded.
+pub const MAX_PARSE_ISSUES: usize = 64;
+/// Stored issue messages are truncated to this many bytes (char-boundary
+/// aligned).
+pub const MAX_ISSUE_MESSAGE_BYTES: usize = 120;
+
 /// Parse a full exposition document.
 pub fn parse_text(input: &str) -> ScrapeText {
     // Tolerate a UTF-8 BOM (some proxies/files prepend one).
@@ -37,13 +45,27 @@ pub fn parse_text(input: &str) -> ScrapeText {
         }
         match parse_sample_line(line) {
             Ok(sample) => attach_sample(sample, &mut out, &mut index),
-            Err(msg) => out.issues.push(ParseIssue {
-                line: line_no,
-                message: msg,
-            }),
+            Err(msg) => record_issue(&mut out, line_no, msg),
         }
     }
     out
+}
+
+/// Count every issue, but store only the first [`MAX_PARSE_ISSUES`], each
+/// message truncated to [`MAX_ISSUE_MESSAGE_BYTES`].
+fn record_issue(out: &mut ScrapeText, line: usize, mut message: String) {
+    out.issue_count += 1;
+    if out.issues.len() >= MAX_PARSE_ISSUES {
+        return;
+    }
+    if message.len() > MAX_ISSUE_MESSAGE_BYTES {
+        let mut end = MAX_ISSUE_MESSAGE_BYTES;
+        while !message.is_char_boundary(end) {
+            end -= 1;
+        }
+        message.truncate(end);
+    }
+    out.issues.push(ParseIssue { line, message });
 }
 
 /// Ensure a family exists, returning its index.

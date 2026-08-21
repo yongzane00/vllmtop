@@ -2,8 +2,8 @@
 //!
 //! These types are produced by [`crate::metrics::parse`] and consumed by the
 //! normalization/state layers. They deliberately preserve *everything* the
-//! endpoint exposed (unknown families included) so the Raw Metrics view can
-//! show data we do not otherwise understand.
+//! endpoint exposed (unknown families included) so curation can evolve
+//! without reparsing.
 
 use std::fmt;
 
@@ -138,7 +138,11 @@ pub struct ParseIssue {
 pub struct ScrapeText {
     /// Families in first-seen order (deterministic display).
     pub families: Vec<MetricFamily>,
+    /// The first [`crate::metrics::parse::MAX_PARSE_ISSUES`] issues only;
+    /// `issue_count` is the honest total.
     pub issues: Vec<ParseIssue>,
+    /// Every issue encountered, including those not stored in `issues`.
+    pub issue_count: usize,
 }
 
 impl ScrapeText {
