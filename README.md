@@ -54,8 +54,8 @@ cargo build --release
 ./target/release/vllmtop --help
 ```
 
-`cargo install --path .` also works. (`cargo install vllmtop` from crates.io
-is planned but blocked on the license decision.)
+`cargo install --path .` also works. (Whether to publish to crates.io is a
+release-time decision; it is not published yet.)
 
 ### Planned binary install (once released)
 
@@ -78,6 +78,10 @@ vllmtop \
 
 # Bare URLs get a stable host:port name
 vllmtop -e http://10.0.0.21:8000
+
+# @CAP declares the server's --max-num-seqs (vLLM doesn't export it), so
+# the endpoint view can draw running as an n/CAP bar
+vllmtop -e dev=http://10.0.0.21:8000@8
 
 # Record history to SQLite (off by default), keep 14 days
 vllmtop --record ~/vllm-history.db --retention-days 14
@@ -150,14 +154,19 @@ redacted (no userinfo or query strings).
   boundaries match.
 - **Endpoint (2…N)** — one server in depth. A pulse strip answers the first
   question at a glance: an animated `GENERATING` indicator while requests
-  are running, generation/prompt tokens/s, running (as an `n/max` bar when
-  the endpoint's `max_running` mirrors the server's `--max-num-seqs` —
-  vLLM doesn't export that cap), waiting, and a full-width KV-cache bar
-  with absolute tokens that visibly grows while a conversation generates.
+  are running, generation/prompt tokens/s with session peaks (`pk`),
+  running (as an `n/max` bar when the endpoint's `max_running` — or the
+  `@CAP` endpoint suffix — mirrors the server's `--max-num-seqs`, which
+  vLLM doesn't export), waiting, lifetime completions served and a token
+  odometer (`tokens 5.4M in / 1.2M out` — prompt tokens consumed / tokens
+  generated since the server started), and a full-width KV-cache bar with
+  absolute tokens that visibly grows while a conversation generates.
   Below it: cache hit rates, finish reasons, errors/aborts, preemptions,
   the latency percentile table (TTFT, inter-token, e2e, queue, prefill,
-  decode; p50/p95/p99/mean over a rolling window), and trend charts.
-  Multi-engine (data-parallel) servers keep separate per-series rows.
+  decode; p50/p95/p99/mean over a rolling window) plus tokens-per-request
+  distributions, and trend charts. Multi-engine (data-parallel) or
+  multi-model servers keep separate per-series rows, including per-model
+  lifetime token totals.
 
 ### Data semantics worth knowing
 
@@ -236,9 +245,21 @@ toolchain; SQLite is bundled, TLS is rustls. See
 
 ## Project status
 
-- **License: not yet decided.** Until a LICENSE file lands, the code is
-  all-rights-reserved by default. Do not vendor or redistribute yet.
 - **Repository owner/URL: not yet decided** — release workflow and the
   installer take the repo as a parameter; both are release blockers.
-- Not yet published to crates.io (`publish = false` guards against
-  accidents until the above are settled).
+- Not yet published to crates.io (`publish = false`; whether to publish at
+  all is a release-time decision).
+
+## License
+
+Licensed under either of
+
+- Apache License, Version 2.0 ([LICENSE-APACHE](LICENSE-APACHE))
+- MIT license ([LICENSE-MIT](LICENSE-MIT))
+
+at your option.
+
+Unless you explicitly state otherwise, any contribution intentionally
+submitted for inclusion in the work by you, as defined in the Apache-2.0
+license, shall be dual licensed as above, without any additional terms or
+conditions.

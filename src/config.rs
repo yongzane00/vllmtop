@@ -295,20 +295,30 @@ fn default_endpoint() -> EndpointConfig {
     }
 }
 
-/// Parse a `--endpoint` argument: `NAME=URL` or bare `URL`.
-/// A `=` only counts as the name separator when it appears before `://`.
+/// Parse a `--endpoint` argument: `NAME=URL` or bare `URL`, optionally with
+/// a trailing `@CAP` (`NAME=URL@8`) declaring the server's `--max-num-seqs`
+/// for the running `n/max` bar — same as `max_running` in the config file.
+/// A `=` only counts as the name separator when it appears before `://`; an
+/// `@` only counts as the cap separator when everything after it is digits,
+/// so userinfo-style URLs cannot false-match.
 fn parse_endpoint_arg(spec: &str) -> Result<EndpointConfig, ConfigError> {
     let scheme_pos = spec.find("://").unwrap_or(spec.len());
     let (name, url_text) = match spec.find('=') {
         Some(eq) if eq < scheme_pos => (Some(&spec[..eq]), &spec[eq + 1..]),
         _ => (None, spec),
     };
+    let (url_text, max_running) = match url_text.rsplit_once('@') {
+        Some((base, cap)) if !cap.is_empty() && cap.bytes().all(|b| b.is_ascii_digit()) => {
+            (base, Some(cap.parse::<u32>().unwrap_or(u32::MAX)))
+        }
+        _ => (url_text, None),
+    };
     build_endpoint(
         name.map(str::to_string),
         url_text,
         None,
         BTreeMap::new(),
-        None,
+        max_running,
     )
 }
 
@@ -445,6 +455,23 @@ mod tests {
         .unwrap();
         assert_eq!(cfg.endpoints[0].name, "spark-a");
         assert_eq!(cfg.endpoints[1].name, "10.0.0.22:8443");
+    }
+
+    #[test]
+    fn endpoint_arg_cap_suffix_sets_max_running() {
+        let cfg = load(&cli(&["-e", "dev=http://10.0.0.21:8000@8"]), no_env).unwrap();
+        assert_eq!(cfg.endpoints[0].name, "dev");
+        assert_eq!(cfg.endpoints[0].url.as_str(), "http://10.0.0.21:8000/");
+        assert_eq!(cfg.endpoints[0].max_running, Some(8));
+    }
+
+    #[test]
+    fn endpoint_arg_userinfo_at_sign_is_not_a_cap_separator() {
+        // Suffix after the last '@' is not all digits -> userinfo, not a cap
+        // (and the userinfo itself is stripped from the stored URL).
+        let cfg = load(&cli(&["-e", "http://user:pw@h:1234"]), no_env).unwrap();
+        assert_eq!(cfg.endpoints[0].max_running, None);
+        assert!(!cfg.endpoints[0].url.as_str().contains("user"));
     }
 
     #[test]

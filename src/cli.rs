@@ -16,8 +16,10 @@ use clap::Parser;
 )]
 pub struct Cli {
     /// Endpoint to monitor, as NAME=URL or bare URL. Repeatable.
+    /// An optional @CAP suffix (NAME=URL@8) declares the server's
+    /// --max-num-seqs so running shows as an n/max bar.
     /// When given, replaces the endpoint list from the config file entirely.
-    #[arg(short, long = "endpoint", value_name = "NAME=URL")]
+    #[arg(short, long = "endpoint", value_name = "NAME=URL[@CAP]")]
     pub endpoints: Vec<String>,
 
     /// Path to a TOML config file (default: ~/.config/vllmtop/config.toml).

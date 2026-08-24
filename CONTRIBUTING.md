@@ -4,9 +4,10 @@ Thanks for your interest! The project is young; the most valuable
 contributions right now are metric-compatibility reports from different vLLM
 versions/backends and fixtures for them.
 
-> **License note:** the project license is not yet decided. Until a LICENSE
-> file exists, contributions cannot be merged from third parties — watch the
-> README's Project status section.
+> **License:** dual MIT OR Apache-2.0 (see [LICENSE-MIT](LICENSE-MIT) and
+> [LICENSE-APACHE](LICENSE-APACHE)). Unless you explicitly state otherwise,
+> any contribution you intentionally submit for inclusion, as defined in the
+> Apache-2.0 license, is dual licensed as above without additional terms.
 
 ## Development setup (Ubuntu / WSL2)
 

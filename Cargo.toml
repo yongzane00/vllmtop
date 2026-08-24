@@ -5,10 +5,11 @@ edition = "2024"
 rust-version = "1.88"
 description = "A colorful terminal dashboard for monitoring vLLM servers over their Prometheus metrics API"
 repository = "https://github.com/OWNER-TBD/vllmtop"
+license = "MIT OR Apache-2.0"
 keywords = ["vllm", "tui", "monitoring", "prometheus", "llm"]
 categories = ["command-line-utilities"]
-# License intentionally undecided (see README). Publishing is blocked until
-# the license and repository owner are settled.
+# Publishing to crates.io is deliberately deferred to release time (owner
+# decision); the repository owner/URL is also still undecided.
 publish = false
 
 [dependencies]

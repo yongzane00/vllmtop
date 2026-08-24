@@ -17,7 +17,7 @@ pub fn draw(frame: &mut Frame, app: &App, index: usize, area: Rect) {
     };
     let [head, pulse, body] = Layout::vertical([
         Constraint::Length(3),
-        Constraint::Length(3),
+        Constraint::Length(4),
         Constraint::Min(0),
     ])
     .areas(area);
@@ -37,8 +37,9 @@ pub fn draw(frame: &mut Frame, app: &App, index: usize, area: Rect) {
 
 /// The "is it alive and how fast" strip: an animated GENERATING indicator,
 /// the two token rates, running (as an `n/max` bar when the config declares
-/// the server's `--max-num-seqs`), waiting, and a full-width KV-cache bar
-/// that visibly grows while a conversation is being generated.
+/// the server's `--max-num-seqs`), waiting, lifetime completions served, and
+/// a full-width KV-cache bar that visibly grows while a conversation is
+/// being generated.
 fn draw_pulse(frame: &mut Frame, app: &App, index: usize, e: &EndpointState, area: Rect) {
     let t = &app.theme;
     let ascii = t.mode == crate::ui::theme::ColorMode::Mono;
@@ -86,7 +87,9 @@ fn draw_pulse(frame: &mut Frame, app: &App, index: usize, e: &EndpointState, are
             t.dim,
         ));
     }
-    line1.push(Span::styled("   running ", t.dim));
+    // Second line: scheduler occupancy plus the lifetime served count —
+    // line 1 already fills a 120-column terminal, so these get their own row.
+    let mut line1b: Vec<Span> = vec![Span::styled("   running ", t.dim)];
     let max_running = app
         .config
         .endpoints
@@ -96,7 +99,7 @@ fn draw_pulse(frame: &mut Frame, app: &App, index: usize, e: &EndpointState, are
     match (agg.running, max_running) {
         (Some(run), Some(max)) => {
             let frac = run / f64::from(max);
-            line1.push(Span::styled(
+            line1b.push(Span::styled(
                 format!(
                     "{}/{} {}",
                     format::count(Some(run)),
@@ -106,15 +109,52 @@ fn draw_pulse(frame: &mut Frame, app: &App, index: usize, e: &EndpointState, are
                 t.by_level(frac, 0.75, 0.95),
             ));
         }
-        (run, _) => line1.push(Span::styled(format::count(run), t.value)),
+        (run, _) => line1b.push(Span::styled(format::count(run), t.value)),
     }
-    line1.push(Span::styled("   waiting ", t.dim));
+    line1b.push(Span::styled("   waiting ", t.dim));
     let wait_style = if agg.waiting.unwrap_or(0.0) > 0.0 {
         t.warn
     } else {
         t.value
     };
-    line1.push(Span::styled(format::count(agg.waiting), wait_style));
+    line1b.push(Span::styled(format::count(agg.waiting), wait_style));
+
+    // Lifetime completions since the server started (counter: resets with a
+    // server restart, which is the honest reading of "served").
+    let served = e.curated.as_ref().and_then(|c| {
+        c.series
+            .values()
+            .filter_map(|s| s.success_total())
+            .fold(None, |acc: Option<f64>, v| Some(acc.unwrap_or(0.0) + v))
+    });
+    if served.is_some() {
+        line1b.push(Span::styled("   served ", t.dim));
+        line1b.push(Span::styled(format::count(served), t.value));
+    }
+
+    // Lifetime token odometer (same restart-reset semantics as `served`):
+    // "in" = prompt tokens consumed, "out" = tokens generated.
+    let life_sum = |get: fn(&CuratedSeries) -> Option<f64>| {
+        e.curated.as_ref().and_then(|c| {
+            c.series
+                .values()
+                .filter_map(get)
+                .fold(None, |acc: Option<f64>, v| Some(acc.unwrap_or(0.0) + v))
+        })
+    };
+    let prompt_life = life_sum(|s| s.prompt_tokens);
+    let gen_life = life_sum(|s| s.generation_tokens);
+    if prompt_life.is_some() || gen_life.is_some() {
+        line1b.push(Span::styled("   tokens ", t.dim));
+        line1b.push(Span::styled(
+            format!(
+                "{} in / {} out",
+                format::count(prompt_life),
+                format::count(gen_life)
+            ),
+            t.value,
+        ));
+    }
 
     // Full-width KV bar with absolute tokens when the server exposes its
     // capacity. This is the aggregate cache: with one conversation running
@@ -161,8 +201,12 @@ fn draw_pulse(frame: &mut Frame, app: &App, index: usize, e: &EndpointState, are
     }
 
     frame.render_widget(
-        Paragraph::new(vec![Line::from(line1), Line::from(line2)])
-            .block(Block::new().borders(Borders::BOTTOM).border_style(t.dim)),
+        Paragraph::new(vec![
+            Line::from(line1),
+            Line::from(line1b),
+            Line::from(line2),
+        ])
+        .block(Block::new().borders(Borders::BOTTOM).border_style(t.dim)),
         area,
     );
 }
@@ -326,6 +370,17 @@ fn push_series_activity(
             "generation tokens/s",
             format::count(d.and_then(|d| d.generation_tps)),
             t.value,
+        ));
+        // Per-model lifetime token totals; the pulse strip only has the
+        // endpoint-wide sum.
+        lines.push(kv(
+            "tokens (life)",
+            format!(
+                "{} in  {} out",
+                format::count(s.prompt_tokens),
+                format::count(s.generation_tokens)
+            ),
+            t.secondary,
         ));
     } else if !s.waiting_by_reason.is_empty() {
         // Waiting reasons have no home in the pulse strip; show them when
