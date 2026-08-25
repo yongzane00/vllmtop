@@ -42,29 +42,22 @@ vllmtop never proxies or inspects inference traffic.)
 
 ## Install
 
-> **Release blocker:** binary releases and the curl installer require the
-> GitHub repository location, which is not yet decided (see
-> [Project status](#project-status)). Until then, build from source.
-
 ### From source
 
 Requires stable Rust (1.88+): <https://rustup.rs>
 
 ```bash
-git clone <repo-url> && cd vllmtop
+git clone https://github.com/yongzane00/vllmtop && cd vllmtop
 cargo build --release
 ./target/release/vllmtop --help
 ```
 
-`cargo install --path .` also works. (Whether to publish to crates.io is a
-release-time decision; it is not published yet.)
+`cargo install --path .` also works.
 
-### Planned binary install (once released)
-
-Release archives for `x86_64-unknown-linux-musl` and
-`aarch64-unknown-linux-musl` with SHA-256 checksums, plus a checksum-verifying
-installer script (`scripts/install.sh`) that installs to `~/.local/bin`
-without root.
+Binary releases are planned: archives for `x86_64-unknown-linux-musl` and
+`aarch64-unknown-linux-musl` with SHA-256 checksums, plus a
+checksum-verifying installer script (`scripts/install.sh`) that installs to
+`~/.local/bin` without root.
 
 ## Usage
 
@@ -279,15 +272,9 @@ cargo build --release
 
 On Ubuntu/WSL2 you need only `build-essential` and rustup's stable
 toolchain; SQLite is bundled, TLS is rustls. See
-[CONTRIBUTING.md](CONTRIBUTING.md) and
-[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
-
-## Project status
-
-- **Repository owner/URL: not yet decided** — release workflow and the
-  installer take the repo as a parameter; both are release blockers.
-- Not yet published to crates.io (`publish = false`; whether to publish at
-  all is a release-time decision).
+[CONTRIBUTING.md](CONTRIBUTING.md) and the
+[documentation index](docs/README.md) — architecture, metric semantics,
+and design deep-dives all live under `docs/`.
 
 ## License
 

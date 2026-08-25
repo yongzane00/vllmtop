@@ -16,7 +16,7 @@ versions/backends and fixtures for them.
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y -c rustfmt -c clippy
 sudo apt-get install -y build-essential   # C toolchain for bundled SQLite
 
-git clone <repo-url> && cd vllmtop
+git clone https://github.com/yongzane00/vllmtop && cd vllmtop
 cargo test
 cargo run -- --help
 ```
