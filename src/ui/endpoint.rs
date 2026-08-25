@@ -24,14 +24,22 @@ pub fn draw(frame: &mut Frame, app: &App, index: usize, area: Rect) {
     draw_head(frame, app, e, head);
     draw_pulse(frame, app, index, e, pulse);
 
-    // Charts get the bottom 40% when there is room for them.
-    if body.height >= 14 {
-        let [tables, charts] =
-            Layout::vertical([Constraint::Percentage(62), Constraint::Percentage(38)]).areas(body);
-        draw_tables(frame, app, e, tables);
-        draw_trends(frame, app, e, charts);
+    if app.endpoint_tables {
+        // 't' view: the ACTIVITY/LATENCY tables, charts below when roomy.
+        if body.height >= 14 {
+            let [tables, charts] =
+                Layout::vertical([Constraint::Percentage(62), Constraint::Percentage(38)])
+                    .areas(body);
+            draw_tables(frame, app, e, tables);
+            draw_trends(frame, app, e, charts);
+        } else {
+            draw_tables(frame, app, e, body);
+        }
     } else {
-        draw_tables(frame, app, e, body);
+        // Default view: token-rate charts left, live requests pane right.
+        let [left, right] = Layout::horizontal([Constraint::Percentage(50); 2]).areas(body);
+        draw_rate_charts(frame, app, e, left);
+        draw_requests(frame, app, index, e, right);
     }
 }
 
@@ -568,7 +576,7 @@ fn draw_latency(frame: &mut Frame, app: &App, e: &EndpointState, area: Rect) {
     );
 }
 
-/// Bottom charts: recent trends for generation throughput and queue depth.
+/// Bottom charts of the tables view ('t'): generation trend + queue depth.
 fn draw_trends(frame: &mut Frame, app: &App, e: &EndpointState, area: Rect) {
     let [left, right] = Layout::horizontal([Constraint::Percentage(50); 2]).areas(area);
     super::charts::draw_single_chart(
@@ -576,6 +584,7 @@ fn draw_trends(frame: &mut Frame, app: &App, e: &EndpointState, area: Rect) {
         app,
         left,
         "generation tokens/s",
+        None,
         &[crate::state::series_id::GENERATION_TPS],
         Some(e),
     );
@@ -584,10 +593,165 @@ fn draw_trends(frame: &mut Frame, app: &App, e: &EndpointState, area: Rect) {
         app,
         right,
         "running / waiting",
+        None,
         &[
             crate::state::series_id::RUNNING,
             crate::state::series_id::WAITING,
         ],
         Some(e),
+    );
+}
+
+/// Default view, left half: prefill (prompt) and generation token rates as
+/// stacked line charts, each with the live rate in its header. Headlines
+/// come from the same aggregate the pulse strip uses, so they always agree.
+fn draw_rate_charts(frame: &mut Frame, app: &App, e: &EndpointState, area: Rect) {
+    let agg = e.aggregate();
+    let rate = |v: Option<f64>| v.map(|v| format!("{} tokens/s", format::count(Some(v))));
+    if area.height >= 12 {
+        let [top, bottom] = Layout::vertical([Constraint::Percentage(50); 2]).areas(area);
+        super::charts::draw_single_chart(
+            frame,
+            app,
+            top,
+            "prefill tokens",
+            rate(agg.prompt_tps),
+            &[crate::state::series_id::PROMPT_TPS],
+            Some(e),
+        );
+        super::charts::draw_single_chart(
+            frame,
+            app,
+            bottom,
+            "generation tokens",
+            rate(agg.generation_tps),
+            &[crate::state::series_id::GENERATION_TPS],
+            Some(e),
+        );
+    } else {
+        // Too short for two readable charts: one combined chart.
+        super::charts::draw_single_chart(
+            frame,
+            app,
+            area,
+            "prefill + generation tokens",
+            rate(agg.generation_tps),
+            &[
+                crate::state::series_id::PROMPT_TPS,
+                crate::state::series_id::GENERATION_TPS,
+            ],
+            Some(e),
+        );
+    }
+}
+
+/// Default view, right half: recent requests from the log tailer.
+fn draw_requests(frame: &mut Frame, app: &App, index: usize, e: &EndpointState, area: Rect) {
+    let t = &app.theme;
+    let now = Instant::now();
+
+    let mut title_spans = vec![Span::styled(" requests ", t.heading)];
+    if !e.requests.is_empty() {
+        title_spans.push(Span::styled(format!("{} ", e.requests.len()), t.dim));
+    }
+    let block = Block::new()
+        .borders(Borders::ALL)
+        .border_style(t.dim)
+        .title(Line::from(title_spans));
+
+    let log_file = app
+        .config
+        .endpoints
+        .get(index)
+        .and_then(|c| c.log_file.as_ref());
+    let empty_note = |text: String, style| {
+        Paragraph::new(Line::from(Span::styled(text, style)))
+            .block(block.clone())
+            .wrap(ratatui::widgets::Wrap { trim: false })
+    };
+
+    // Empty states, most fundamental first.
+    let Some(path) = log_file else {
+        frame.render_widget(
+            empty_note(
+                " no log configured — set log_file for this endpoint in the \
+                 config file (see examples/config.toml)"
+                    .into(),
+                t.na,
+            ),
+            area,
+        );
+        return;
+    };
+    if e.requests.tail_status == Some(crate::logtail::TailStatus::FileMissing) {
+        frame.render_widget(
+            empty_note(format!(" log file not found: {}", path.display()), t.warn),
+            area,
+        );
+        return;
+    }
+    if e.requests.is_empty() {
+        frame.render_widget(
+            empty_note(
+                " waiting for requests… (new requests only; the server needs \
+                 --enable-log-requests, and VLLM_LOGGING_LEVEL=DEBUG for \
+                 prompt previews)"
+                    .into(),
+                t.na,
+            ),
+            area,
+        );
+        return;
+    }
+
+    let header = Row::new(
+        ["age", "prompt", "req id", "max_tok"]
+            .into_iter()
+            .map(|h| Cell::from(Span::styled(h, t.heading))),
+    );
+    // Rows bounded by what fits: newest first, no point building all 200.
+    let visible = area.height.saturating_sub(3) as usize; // borders + header
+    let rows: Vec<Row> = e
+        .requests
+        .iter_newest_first()
+        .take(visible.max(1))
+        .map(|entry| {
+            let finished = matches!(
+                entry.status,
+                crate::state::requests::RequestStatus::Finished { .. }
+            );
+            let row_style = if finished { t.dim } else { t.text };
+            let age = format::brief_duration(now.saturating_duration_since(entry.seen_at));
+            let prompt = match &entry.prompt_preview {
+                Some(p) => Span::styled(p.clone(), row_style),
+                None => Span::styled(format::NA, t.na),
+            };
+            Row::new(vec![
+                Cell::from(Span::styled(age, t.dim)),
+                Cell::from(prompt),
+                Cell::from(Span::styled(format::truncate(&entry.id, 14), t.secondary)),
+                Cell::from(Span::styled(
+                    entry
+                        .max_tokens
+                        .map(|m| m.to_string())
+                        .unwrap_or_else(|| format::NA.into()),
+                    t.value,
+                )),
+            ])
+        })
+        .collect();
+
+    let widths = [
+        Constraint::Length(5),
+        Constraint::Min(10),
+        Constraint::Length(14),
+        Constraint::Length(7),
+    ];
+    frame.render_widget(
+        Table::new(rows, widths)
+            .header(header)
+            .column_spacing(1)
+            .block(block),
+        area,
     );
 }

@@ -24,6 +24,17 @@ pub enum AppEvent {
         endpoint: usize,
         outcome: ScrapeOutcome,
     },
+    /// Result of the (blocking, off-loop) daily-usage query against the
+    /// recorded history. Err strings are display-safe.
+    UsageLoaded(Result<crate::storage::usage::DailyUsage, String>),
+    /// A batch of parsed per-request log lines from one endpoint's tailer.
+    RequestLog {
+        endpoint: usize,
+        /// Stamped by the tailer at read time; entries in a batch share it.
+        at: Instant,
+        status: crate::logtail::TailStatus,
+        events: Vec<crate::logtail::parse::LogEvent>,
+    },
     /// Keyboard input from the terminal.
     Key(KeyEvent),
     /// Mouse input (scrolling in lists).

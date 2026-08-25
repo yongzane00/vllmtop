@@ -109,6 +109,14 @@ fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
             ("q", "quit"),
             ("Tab", "views"),
             ("1", "fleet"),
+            (
+                "t",
+                if app.endpoint_tables {
+                    "charts"
+                } else {
+                    "tables"
+                },
+            ),
             ("r", "refresh"),
             ("p", "pause"),
             ("+/-", "interval"),

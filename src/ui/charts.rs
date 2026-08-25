@@ -227,12 +227,14 @@ fn draw_metric_chart(
 }
 
 /// A single standalone chart for one or two series ids of ONE endpoint
-/// (used by the endpoint detail view's trend row).
+/// (used by the endpoint detail view). `headline` is a pre-formatted live
+/// value shown next to the title (e.g. "257.6 tokens/s"); `None` hides it.
 pub fn draw_single_chart(
     frame: &mut Frame,
     app: &App,
     area: Rect,
     title: &str,
+    headline: Option<String>,
     ids: &[&'static str],
     endpoint: Option<&EndpointState>,
 ) {
@@ -262,10 +264,15 @@ pub fn draw_single_chart(
         }
     }
 
+    let mut title_spans = vec![Span::styled(format!(" {title} "), t.heading)];
+    if let Some(h) = headline {
+        title_spans.push(Span::styled(h, t.value));
+        title_spans.push(Span::raw(" "));
+    }
     let block = Block::new()
         .borders(Borders::ALL)
         .border_style(t.dim)
-        .title(Span::styled(format!(" {title} "), t.heading));
+        .title(Line::from(title_spans));
 
     if lines_data.is_empty() {
         frame.render_widget(

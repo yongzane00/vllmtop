@@ -79,9 +79,10 @@ async fn run(
     let (tx, rx) = mpsc::channel::<AppEvent>(256);
 
     let control = vllmtop::collector::spawn_all(&config, tx.clone());
-    spawn_input_thread(tx);
+    vllmtop::logtail::spawn_all(&config, tx.clone());
+    spawn_input_thread(tx.clone());
 
-    let app = App::new(config, theme, control);
+    let app = App::new(config, theme, control, tx);
     app.run(terminal, rx).await
 }
 

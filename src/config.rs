@@ -77,6 +77,10 @@ pub struct EndpointConfig {
     /// The server's `--max-num-seqs`, declared by the user (vLLM does not
     /// export it). When set, running requests render as an `n/max` bar.
     pub max_running: Option<u32>,
+    /// Path to the vLLM server's stdout log for the per-request pane.
+    /// Read-only, local, opt-in; the server needs `--enable-log-requests`
+    /// (and `VLLM_LOGGING_LEVEL=DEBUG` for prompt previews).
+    pub log_file: Option<PathBuf>,
 }
 
 impl EndpointConfig {
@@ -136,9 +140,30 @@ pub struct Config {
     pub history_window: Duration,
     pub percentile_window: Duration,
     pub retention_days: u32,
-    pub record_path: Option<PathBuf>,
+    pub record: RecordSetting,
     pub no_color: bool,
     pub endpoints: Vec<EndpointConfig>,
+}
+
+/// Where recorded history goes. Recording is ON by default (the fleet
+/// daily-usage charts read from it); the variants keep the *reason* it is
+/// off so the UI can say why usage data is unavailable.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RecordSetting {
+    Enabled(PathBuf),
+    /// `--no-record` / `no_record = true`.
+    DisabledByUser,
+    /// No path given and no default resolvable (message is display-safe).
+    Unavailable(String),
+}
+
+impl RecordSetting {
+    pub fn path(&self) -> Option<&Path> {
+        match self {
+            RecordSetting::Enabled(p) => Some(p),
+            _ => None,
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -152,6 +177,10 @@ struct FileConfig {
     history_seconds: Option<u64>,
     percentile_window_seconds: Option<u64>,
     retention_days: Option<u32>,
+    /// Recording destination; overrides the default data-dir path.
+    record_path: Option<PathBuf>,
+    /// `true` disables recording (and the daily-usage charts).
+    no_record: Option<bool>,
     #[serde(default)]
     endpoints: Vec<FileEndpoint>,
 }
@@ -166,6 +195,8 @@ struct FileEndpoint {
     header_env: BTreeMap<String, String>,
     /// Mirror of the server's `--max-num-seqs`, for the running-requests bar.
     max_running: Option<u32>,
+    /// vLLM stdout log to tail for the per-request pane (local, read-only).
+    log_file: Option<PathBuf>,
 }
 
 // ---------------------------------------------------------------------------
@@ -181,7 +212,8 @@ pub fn load(cli: &Cli, get_env: impl Fn(&str) -> Option<String>) -> Result<Confi
             _ => None,
         },
     };
-    merge(cli, file.unwrap_or_default())
+    let default_record = default_record_path(&get_env);
+    merge(cli, file.unwrap_or_default(), default_record)
 }
 
 fn read_file(path: &Path) -> Result<FileConfig, ConfigError> {
@@ -205,7 +237,25 @@ fn default_config_path(get_env: &impl Fn(&str) -> Option<String>) -> Option<Path
     })
 }
 
-fn merge(cli: &Cli, file: FileConfig) -> Result<Config, ConfigError> {
+/// `$XDG_DATA_HOME/vllmtop/usage.db`, else `~/.local/share/vllmtop/usage.db`.
+fn default_record_path(get_env: &impl Fn(&str) -> Option<String>) -> Option<PathBuf> {
+    if let Some(xdg) = get_env("XDG_DATA_HOME").filter(|v| !v.is_empty()) {
+        return Some(PathBuf::from(xdg).join("vllmtop").join("usage.db"));
+    }
+    get_env("HOME").filter(|v| !v.is_empty()).map(|home| {
+        PathBuf::from(home)
+            .join(".local")
+            .join("share")
+            .join("vllmtop")
+            .join("usage.db")
+    })
+}
+
+fn merge(
+    cli: &Cli,
+    file: FileConfig,
+    default_record: Option<PathBuf>,
+) -> Result<Config, ConfigError> {
     let refresh_ms = cli
         .refresh_interval_ms
         .or(file.refresh_interval_ms)
@@ -261,12 +311,32 @@ fn merge(cli: &Cli, file: FileConfig) -> Result<Config, ConfigError> {
         }
     }
 
+    // Recording resolution, most explicit first: CLI kill-switch, CLI path,
+    // file kill-switch, file path, data-dir default.
+    let record = if cli.no_record {
+        RecordSetting::DisabledByUser
+    } else if let Some(path) = &cli.record {
+        RecordSetting::Enabled(path.clone())
+    } else if file.no_record == Some(true) {
+        RecordSetting::DisabledByUser
+    } else if let Some(path) = file.record_path {
+        RecordSetting::Enabled(path)
+    } else if let Some(path) = default_record {
+        RecordSetting::Enabled(path)
+    } else {
+        RecordSetting::Unavailable(
+            "cannot resolve a default data path (XDG_DATA_HOME and HOME unset); \
+             pass --record PATH or --no-record"
+                .into(),
+        )
+    };
+
     Ok(Config {
         refresh_interval: Duration::from_millis(refresh_ms),
         history_window: Duration::from_secs(history_secs),
         percentile_window: Duration::from_secs(percentile_secs),
         retention_days,
-        record_path: cli.record.clone(),
+        record,
         no_color: cli.no_color,
         endpoints,
     })
@@ -292,6 +362,7 @@ fn default_endpoint() -> EndpointConfig {
         bearer_token_env: None,
         header_env: BTreeMap::new(),
         max_running: None,
+        log_file: None,
     }
 }
 
@@ -319,6 +390,7 @@ fn parse_endpoint_arg(spec: &str) -> Result<EndpointConfig, ConfigError> {
         None,
         BTreeMap::new(),
         max_running,
+        None,
     )
 }
 
@@ -329,6 +401,7 @@ fn file_endpoint(fe: FileEndpoint) -> Result<EndpointConfig, ConfigError> {
         fe.bearer_token_env,
         fe.header_env,
         fe.max_running,
+        fe.log_file,
     )
 }
 
@@ -338,6 +411,7 @@ fn build_endpoint(
     bearer_token_env: Option<String>,
     header_env: BTreeMap<String, String>,
     max_running: Option<u32>,
+    log_file: Option<PathBuf>,
 ) -> Result<EndpointConfig, ConfigError> {
     // Error paths must never echo raw URL text (it may carry credentials in
     // userinfo or query form, which we also refuse to send).
@@ -369,6 +443,7 @@ fn build_endpoint(
         bearer_token_env,
         header_env,
         max_running,
+        log_file,
     })
 }
 
@@ -438,7 +513,84 @@ mod tests {
         assert_eq!(cfg.endpoints.len(), 1);
         assert_eq!(cfg.endpoints[0].name, "local");
         assert_eq!(cfg.endpoints[0].url.as_str(), "http://127.0.0.1:8000/");
-        assert!(cfg.record_path.is_none());
+        // No env at all: recording cannot resolve a default path, and the
+        // reason is preserved for display.
+        assert!(matches!(cfg.record, RecordSetting::Unavailable(_)));
+    }
+
+    #[test]
+    fn record_defaults_to_xdg_data_home() {
+        let env = |k: &str| (k == "XDG_DATA_HOME").then(|| "/xdg-data".to_string());
+        let cfg = load(&cli(&[]), env).unwrap();
+        assert_eq!(
+            cfg.record.path(),
+            Some(Path::new("/xdg-data/vllmtop/usage.db"))
+        );
+    }
+
+    #[test]
+    fn record_falls_back_to_home_local_share() {
+        let env = |k: &str| (k == "HOME").then(|| "/home/u".to_string());
+        let cfg = load(&cli(&[]), env).unwrap();
+        assert_eq!(
+            cfg.record.path(),
+            Some(Path::new("/home/u/.local/share/vllmtop/usage.db"))
+        );
+    }
+
+    #[test]
+    fn no_record_flag_disables_recording() {
+        let env = |k: &str| (k == "HOME").then(|| "/home/u".to_string());
+        let cfg = load(&cli(&["--no-record"]), env).unwrap();
+        assert_eq!(cfg.record, RecordSetting::DisabledByUser);
+    }
+
+    #[test]
+    fn record_flag_overrides_default_path() {
+        let env = |k: &str| (k == "HOME").then(|| "/home/u".to_string());
+        let cfg = load(&cli(&["--record", "/tmp/x.db"]), env).unwrap();
+        assert_eq!(cfg.record.path(), Some(Path::new("/tmp/x.db")));
+    }
+
+    #[test]
+    fn file_no_record_beats_file_record_path_and_cli_record_beats_both() {
+        let file: FileConfig =
+            toml::from_str("no_record = true\nrecord_path = \"/from-file.db\"").unwrap();
+        let merged = merge(&cli(&[]), file, Some(PathBuf::from("/default.db"))).unwrap();
+        assert_eq!(merged.record, RecordSetting::DisabledByUser);
+
+        let file: FileConfig =
+            toml::from_str("no_record = true\nrecord_path = \"/from-file.db\"").unwrap();
+        let merged = merge(
+            &cli(&["--record", "/cli.db"]),
+            file,
+            Some(PathBuf::from("/default.db")),
+        )
+        .unwrap();
+        assert_eq!(merged.record.path(), Some(Path::new("/cli.db")));
+    }
+
+    #[test]
+    fn log_file_parsed_from_toml_and_absent_on_cli_endpoints() {
+        let file: FileConfig = toml::from_str(
+            "[[endpoints]]\nurl = \"http://h:1\"\nlog_file = \"/var/log/vllm/server.log\"",
+        )
+        .unwrap();
+        let merged = merge(&cli(&[]), file, None).unwrap();
+        assert_eq!(
+            merged.endpoints[0].log_file.as_deref(),
+            Some(Path::new("/var/log/vllm/server.log"))
+        );
+        // CLI endpoints have no log_file syntax: always None.
+        let cfg = load(&cli(&["-e", "dev=http://h:1@8"]), no_env).unwrap();
+        assert_eq!(cfg.endpoints[0].log_file, None);
+    }
+
+    #[test]
+    fn file_record_path_beats_default() {
+        let file: FileConfig = toml::from_str("record_path = \"/from-file.db\"").unwrap();
+        let merged = merge(&cli(&[]), file, Some(PathBuf::from("/default.db"))).unwrap();
+        assert_eq!(merged.record.path(), Some(Path::new("/from-file.db")));
     }
 
     #[test]
@@ -681,6 +833,7 @@ url = "https://10.0.0.22:8443"
             bearer_token_env: Some("TOK".into()),
             header_env: BTreeMap::from([("X-Auth".to_string(), "XAUTH".to_string())]),
             max_running: None,
+            log_file: None,
         };
         let ok = ep
             .resolve_auth(|k| match k {

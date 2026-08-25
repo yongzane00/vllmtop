@@ -2,6 +2,7 @@
 //! reducing collector events, read by the renderer. No locks, no sharing.
 
 pub mod history;
+pub mod requests;
 
 use std::collections::{BTreeMap, HashMap};
 use std::time::{Duration, Instant, SystemTime};
@@ -26,6 +27,7 @@ pub mod series_id {
     pub const ERRORS: &str = "errors";
     pub const PREEMPTIONS: &str = "preemptions";
 
+    /// The chart-ring set: ids with in-memory history, recorded at 1 Hz.
     pub const ALL: &[&str] = &[
         RUNNING,
         WAITING,
@@ -39,6 +41,15 @@ pub mod series_id {
         ERRORS,
         PREEMPTIONS,
     ];
+
+    // Cumulative counter snapshots, recorded (throttled) for the daily-usage
+    // charts. Deliberately NOT in `ALL`: they get no in-memory ring.
+    pub const PROMPT_TOKENS_TOTAL: &str = "prompt_tokens_total";
+    pub const GENERATION_TOKENS_TOTAL: &str = "generation_tokens_total";
+    pub const REQUESTS_TOTAL: &str = "requests_total";
+
+    /// Single source of truth for the usage query's metric list.
+    pub const CUMULATIVE: &[&str] = &[PROMPT_TOKENS_TOTAL, GENERATION_TOKENS_TOTAL, REQUESTS_TOTAL];
 }
 
 /// What a collector reports after one poll cycle.
@@ -139,6 +150,9 @@ pub struct EndpointState {
     pub restart_seen_at: Option<Instant>,
     /// Rolling history per (series, metric id).
     pub history: HashMap<(SeriesKey, &'static str), RingSeries>,
+    /// Recent requests from the (opt-in) log tailer. Prompt previews live
+    /// only here — see `state::requests` for the privacy firewall.
+    pub requests: requests::RequestLog,
 
     counters: CounterBank<(SeriesKey, String)>,
     windows: HashMap<(SeriesKey, &'static str), HistogramWindow>,
@@ -174,6 +188,7 @@ impl EndpointState {
             peak_prompt_tps: None,
             restart_seen_at: None,
             history: HashMap::new(),
+            requests: requests::RequestLog::default(),
             counters: CounterBank::new(),
             windows: HashMap::new(),
             history_window,
@@ -422,6 +437,30 @@ impl EndpointState {
         rows
     }
 
+    /// Cumulative counter snapshots for the SQLite recorder ONLY — never fed
+    /// into the in-memory chart rings (no ring allocation, no chart panel).
+    /// The daily-usage query reconstructs per-day totals from these via
+    /// restart-aware positive deltas, which integrated rates cannot provide.
+    pub fn cumulative_samples(&self) -> Vec<(SeriesKey, &'static str, f64)> {
+        let Some(curated) = &self.curated else {
+            return Vec::new();
+        };
+        let mut rows = Vec::new();
+        for (key, series) in &curated.series {
+            let pairs: [(&'static str, Option<f64>); 3] = [
+                (series_id::PROMPT_TOKENS_TOTAL, series.prompt_tokens),
+                (series_id::GENERATION_TOKENS_TOTAL, series.generation_tokens),
+                (series_id::REQUESTS_TOTAL, series.success_total()),
+            ];
+            for (id, value) in pairs {
+                if let Some(v) = value {
+                    rows.push((key.clone(), id, v));
+                }
+            }
+        }
+        rows
+    }
+
     /// Endpoint-level aggregate over all series (fleet view building block).
     pub fn aggregate(&self) -> EndpointAggregate {
         let mut agg = EndpointAggregate::default();
@@ -623,6 +662,27 @@ vllm:request_success_total{{engine="0",finished_reason="error",model_name="m"}} 
         // Rates recover on the next interval.
         e.apply(scrape(base, 2.0, &metrics_text(200.0, 160.0, 2.0, 0.0)));
         assert_eq!(e.derived[&key()].prompt_tps, Some(100.0));
+    }
+
+    #[test]
+    fn cumulative_samples_snapshot_counters_without_ring_history() {
+        let base = Instant::now();
+        let mut e = ep();
+        e.apply(scrape(base, 0.0, &metrics_text(1000.0, 500.0, 10.0, 2.0)));
+        let rows = e.cumulative_samples();
+        // Unlike rates, snapshots exist from the FIRST scrape.
+        let get = |id: &str| rows.iter().find(|(_, m, _)| *m == id).map(|(_, _, v)| *v);
+        assert_eq!(rows.len(), 3);
+        assert_eq!(get(series_id::PROMPT_TOKENS_TOTAL), Some(1000.0));
+        assert_eq!(get(series_id::GENERATION_TOKENS_TOTAL), Some(500.0));
+        // stop + error finish reasons.
+        assert_eq!(get(series_id::REQUESTS_TOTAL), Some(12.0));
+        // And they never allocate in-memory chart rings.
+        assert!(
+            e.history
+                .keys()
+                .all(|(_, id)| !series_id::CUMULATIVE.contains(id))
+        );
     }
 
     #[test]

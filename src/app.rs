@@ -53,6 +53,23 @@ impl FleetSort {
     }
 }
 
+/// Record cumulative counter snapshots at most this often (per endpoint).
+/// One cadence bounds the error at day boundaries and restarts; 30 s keeps
+/// the usage rows ~0.3% of the recorder's volume.
+const COUNTER_RECORD_EVERY: Duration = Duration::from_secs(30);
+/// Re-run the daily-usage query this often (plus on startup and on `r`).
+const USAGE_REFRESH_EVERY: Duration = Duration::from_secs(300);
+
+/// Cached result of the daily-usage query, plus why it may be unavailable.
+#[derive(Debug, Default)]
+pub struct UsageCache {
+    /// Last good result; kept across later query failures.
+    pub data: Option<crate::storage::usage::DailyUsage>,
+    pub last_error: Option<String>,
+    /// Recording is off/broken, with the display-safe reason.
+    pub disabled: Option<String>,
+}
+
 pub struct App {
     pub config: Config,
     pub theme: Theme,
@@ -65,19 +82,35 @@ pub struct App {
     pub fleet_chart_scroll: usize,
     pub paused: bool,
     pub show_help: bool,
+    /// Endpoint view: `false` = charts + requests pane (default), `true` =
+    /// the ACTIVITY/LATENCY tables ('t' toggles).
+    pub endpoint_tables: bool,
     /// Runtime-adjustable; starts at config.refresh_interval.
     pub refresh_interval: Duration,
     pub recorder: Option<Recorder>,
     /// Recording failed to start (shown in the header; app keeps running).
     pub recorder_error: Option<String>,
+    /// Fleet daily-usage charts read this, never the database directly.
+    pub usage: UsageCache,
+    usage_query_in_flight: bool,
+    usage_last_query: Option<Instant>,
+    /// Per-endpoint last cumulative-counter snapshot (throttle state).
+    counter_recorded_at: Vec<Option<Instant>>,
+    /// For handing results of off-loop work back into the reducer.
+    events_tx: mpsc::Sender<AppEvent>,
     control: CollectorControl,
     should_quit: bool,
     dirty: bool,
 }
 
 impl App {
-    pub fn new(config: Config, theme: Theme, control: CollectorControl) -> App {
-        let endpoints = config
+    pub fn new(
+        config: Config,
+        theme: Theme,
+        control: CollectorControl,
+        events_tx: mpsc::Sender<AppEvent>,
+    ) -> App {
+        let endpoints: Vec<EndpointState> = config
             .endpoints
             .iter()
             .map(|e| {
@@ -89,13 +122,22 @@ impl App {
                 )
             })
             .collect();
-        let (recorder, recorder_error) = match &config.record_path {
+        let (recorder, recorder_error) = match config.record.path() {
             Some(path) => match Recorder::start(path, config.retention_days) {
                 Ok(r) => (Some(r), None),
                 Err(e) => (None, Some(e)),
             },
             None => (None, None),
         };
+        // The daily-usage charts must say WHY they are empty, not show zeros.
+        let usage_disabled = match &config.record {
+            crate::config::RecordSetting::Enabled(_) => recorder_error.clone(),
+            crate::config::RecordSetting::DisabledByUser => {
+                Some("recording disabled (--no-record)".into())
+            }
+            crate::config::RecordSetting::Unavailable(reason) => Some(reason.clone()),
+        };
+        let n = endpoints.len();
         App {
             refresh_interval: config.refresh_interval,
             theme,
@@ -106,8 +148,18 @@ impl App {
             fleet_chart_scroll: 0,
             paused: false,
             show_help: false,
+            endpoint_tables: false,
             recorder,
             recorder_error,
+            usage: UsageCache {
+                data: None,
+                last_error: None,
+                disabled: usage_disabled,
+            },
+            usage_query_in_flight: false,
+            usage_last_query: None,
+            counter_recorded_at: vec![None; n],
+            events_tx,
             control,
             should_quit: false,
             dirty: true,
@@ -157,6 +209,9 @@ impl App {
                     if !self.paused {
                         self.dirty = true;
                     }
+                    // Usage refresh runs even while paused: pause freezes
+                    // the display, never collection.
+                    self.maybe_spawn_usage_query();
                 }
                 _ = term_signal => break,
             }
@@ -221,30 +276,107 @@ impl App {
                 }
                 self.dirty = true;
             }
+            AppEvent::RequestLog {
+                endpoint,
+                at,
+                status,
+                events,
+            } => {
+                let Some(state) = self.endpoints.get_mut(endpoint) else {
+                    return;
+                };
+                state.requests.apply(at, status, events);
+                if !self.paused {
+                    self.dirty = true;
+                }
+            }
+            AppEvent::UsageLoaded(result) => {
+                self.usage_query_in_flight = false;
+                match result {
+                    Ok(data) => {
+                        self.usage.data = Some(data);
+                        self.usage.last_error = None;
+                    }
+                    // Keep the last good data; surface the error alongside.
+                    Err(e) => self.usage.last_error = Some(e),
+                }
+                if !self.paused {
+                    self.dirty = true;
+                }
+            }
             AppEvent::Resize => self.dirty = true,
             AppEvent::InputClosed => self.should_quit = true,
         }
     }
 
     fn record_samples(&mut self, endpoint: usize) {
-        let Some(recorder) = &self.recorder else {
+        if self.recorder.is_none() {
             return;
-        };
+        }
+        let now = Instant::now();
+        let cumulative_due = self.counter_record_due(endpoint, now);
+        if cumulative_due && let Some(slot) = self.counter_recorded_at.get_mut(endpoint) {
+            *slot = Some(now);
+        }
         let state = &self.endpoints[endpoint];
         let ts_ms = now_ms();
-        let rows: Vec<SampleRow> = state
-            .current_samples()
-            .into_iter()
-            .map(|(key, metric, value)| SampleRow {
+        let to_row =
+            |(key, metric, value): (crate::metrics::normalize::SeriesKey, &str, f64)| SampleRow {
                 ts_ms,
                 endpoint: state.name.clone(),
                 model: key.model,
                 engine: key.engine,
                 metric: metric.to_string(),
                 value,
-            })
-            .collect();
-        recorder.record(rows);
+            };
+        let mut rows: Vec<SampleRow> = state.current_samples().into_iter().map(to_row).collect();
+        if cumulative_due {
+            rows.extend(state.cumulative_samples().into_iter().map(to_row));
+        }
+        if let Some(recorder) = &self.recorder {
+            recorder.record(rows);
+        }
+    }
+
+    /// Cumulative counters are snapshotted at most every
+    /// [`COUNTER_RECORD_EVERY`]; the first successful scrape records
+    /// immediately.
+    fn counter_record_due(&self, endpoint: usize, now: Instant) -> bool {
+        match self.counter_recorded_at.get(endpoint).copied().flatten() {
+            None => true,
+            Some(at) => now.saturating_duration_since(at) >= COUNTER_RECORD_EVERY,
+        }
+    }
+
+    fn usage_query_due(&self, now: Instant) -> bool {
+        if self.recorder.is_none() || self.usage_query_in_flight {
+            return false;
+        }
+        match self.usage_last_query {
+            None => true,
+            Some(at) => now.saturating_duration_since(at) >= USAGE_REFRESH_EVERY,
+        }
+    }
+
+    /// Kick the blocking daily-usage query onto a worker thread; the result
+    /// comes back through the event channel. At most one in flight.
+    fn maybe_spawn_usage_query(&mut self) {
+        let now = Instant::now();
+        if !self.usage_query_due(now) {
+            return;
+        }
+        let Some(recorder) = &self.recorder else {
+            return;
+        };
+        let path = recorder.path().to_path_buf();
+        let tx = self.events_tx.clone();
+        self.usage_query_in_flight = true;
+        self.usage_last_query = Some(now);
+        tokio::task::spawn_blocking(move || {
+            let result = crate::storage::usage::query_daily_usage(&path);
+            // Send failure just means the app is shutting down.
+            let _ = tx.blocking_send(AppEvent::UsageLoaded(result));
+        });
     }
 
     fn handle_key(&mut self, key: KeyEvent) {
@@ -275,8 +407,18 @@ impl App {
                     self.view = View::Endpoint(idx);
                 }
             }
-            KeyCode::Char('r') => self.control.force_refresh(),
+            KeyCode::Char('r') => {
+                self.control.force_refresh();
+                // Also refresh the daily-usage charts right away.
+                self.usage_last_query = None;
+                self.maybe_spawn_usage_query();
+            }
             KeyCode::Char('p') => self.paused = !self.paused,
+            KeyCode::Char('t') => {
+                if matches!(self.view, View::Endpoint(_)) {
+                    self.endpoint_tables = !self.endpoint_tables;
+                }
+            }
             // '+' = faster refresh = SHORTER interval (matches README).
             KeyCode::Char('+') | KeyCode::Char('=') => self.adjust_interval(-1),
             KeyCode::Char('-') => self.adjust_interval(1),
@@ -437,11 +579,89 @@ mod tests {
             interval_tx,
             force_tx,
         };
-        App::new(config, Theme::mono(), control)
+        // Tests never spawn the usage query (no recorder without env), so a
+        // small dangling channel is fine.
+        let (events_tx, _events_rx) = mpsc::channel(8);
+        App::new(config, Theme::mono(), control, events_tx)
     }
 
     fn key(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    #[test]
+    fn usage_loaded_ok_populates_cache_and_err_keeps_last_good_data() {
+        let mut app = test_app(&["http://h:1"]);
+        let data = crate::storage::usage::DailyUsage {
+            days: Vec::new(),
+            queried_at_ms: 5,
+        };
+        app.handle_event(AppEvent::UsageLoaded(Ok(data)));
+        assert_eq!(app.usage.data.as_ref().map(|d| d.queried_at_ms), Some(5));
+        assert!(app.usage.last_error.is_none());
+        // A later failure keeps the last good data and surfaces the error.
+        app.handle_event(AppEvent::UsageLoaded(Err("boom".into())));
+        assert_eq!(app.usage.data.as_ref().map(|d| d.queried_at_ms), Some(5));
+        assert_eq!(app.usage.last_error.as_deref(), Some("boom"));
+    }
+
+    #[test]
+    fn usage_disabled_reason_is_kept_when_recording_unavailable() {
+        // test_app runs with no env: no default data path can resolve.
+        let app = test_app(&["http://h:1"]);
+        assert!(app.recorder.is_none());
+        assert!(app.usage.disabled.is_some());
+    }
+
+    #[test]
+    fn counter_record_due_fires_immediately_then_throttles() {
+        let mut app = test_app(&["http://h:1"]);
+        let now = Instant::now();
+        assert!(app.counter_record_due(0, now));
+        app.counter_recorded_at[0] = Some(now);
+        assert!(!app.counter_record_due(0, now + Duration::from_secs(29)));
+        assert!(app.counter_record_due(0, now + COUNTER_RECORD_EVERY));
+    }
+
+    #[test]
+    fn usage_query_never_due_without_a_recorder() {
+        let app = test_app(&["http://h:1"]);
+        assert!(!app.usage_query_due(Instant::now()));
+    }
+
+    #[test]
+    fn t_toggles_tables_only_in_endpoint_view() {
+        let mut app = test_app(&["http://h:1"]);
+        assert!(!app.endpoint_tables);
+        app.handle_key(key(KeyCode::Char('t'))); // fleet view: no-op
+        assert!(!app.endpoint_tables);
+        app.view = View::Endpoint(0);
+        app.handle_key(key(KeyCode::Char('t')));
+        assert!(app.endpoint_tables);
+        app.handle_key(key(KeyCode::Char('t')));
+        assert!(!app.endpoint_tables);
+    }
+
+    #[test]
+    fn request_log_event_reduces_into_endpoint_state() {
+        let mut app = test_app(&["http://h:1"]);
+        app.handle_event(AppEvent::RequestLog {
+            endpoint: 0,
+            at: Instant::now(),
+            status: crate::logtail::TailStatus::Tailing,
+            events: vec![crate::logtail::parse::LogEvent::Received {
+                id: "cmpl-1".into(),
+                max_tokens: Some(8),
+            }],
+        });
+        assert_eq!(app.endpoints[0].requests.len(), 1);
+        // Out-of-range endpoint indices are ignored, never panic.
+        app.handle_event(AppEvent::RequestLog {
+            endpoint: 99,
+            at: Instant::now(),
+            status: crate::logtail::TailStatus::Tailing,
+            events: Vec::new(),
+        });
     }
 
     #[test]

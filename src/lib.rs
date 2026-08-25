@@ -12,6 +12,7 @@ pub mod cli;
 pub mod collector;
 pub mod config;
 pub mod event;
+pub mod logtail;
 pub mod metrics;
 pub mod state;
 pub mod storage;

@@ -34,9 +34,11 @@ vllmtop            # monitors http://127.0.0.1:8000
   through an alias table; unknown or backend-specific metrics are parsed and
   tolerated (curation simply ignores them).
 
-**What it deliberately does not do** (v1): per-request/user/conversation
-visibility, GPU/CPU/host hardware monitoring, alerts or webhooks, web UI,
-log ingestion, OpenTelemetry, server control, network discovery, telemetry.
+**What it deliberately does not do** (v1): per-user/conversation
+attribution, GPU/CPU/host hardware monitoring, alerts or webhooks, web UI,
+OpenTelemetry, server control, network discovery, telemetry. (Per-request
+visibility exists only via the opt-in local [log tailer](#requests-pane-log-tailing);
+vllmtop never proxies or inspects inference traffic.)
 
 ## Install
 
@@ -83,8 +85,10 @@ vllmtop -e http://10.0.0.21:8000
 # the endpoint view can draw running as an n/CAP bar
 vllmtop -e dev=http://10.0.0.21:8000@8
 
-# Record history to SQLite (off by default), keep 14 days
+# Recording is ON by default (~/.local/share/vllmtop/usage.db) — it feeds
+# the fleet daily-usage charts. Custom path / retention / opt-out:
 vllmtop --record ~/vllm-history.db --retention-days 14
+vllmtop --no-record
 
 # Slower refresh, more in-memory history
 # (history is also capped at 4096 points per series, so at a 1s refresh the
@@ -133,25 +137,27 @@ redacted (no userinfo or query strings).
 | `PgUp`/`PgDn`, mouse wheel | scroll the history charts |
 | `g` / `G` | jump to top / last row |
 | `s` | cycle fleet sort column |
-| `r` | force refresh now |
+| `t` | endpoint view: toggle charts+requests / tables |
+| `r` | force refresh now (also re-queries daily usage) |
 | `p` | pause display refresh (collection continues) |
 | `+` / `-` | faster / slower refresh |
 | `?` | help |
 
 ### Views
 
-- **Fleet (1)** — everything at a glance. Top: fleet totals and a dense
-  per-endpoint table (health/staleness, model, running/waiting, KV bar,
-  prompt/generation throughput, completion rate, worst TTFT p95, new
-  errors/preemptions, data age). Below: a scrollable grid of rolling history
-  charts (default 5 min at 1 s resolution) for running/waiting, KV usage,
-  throughputs, completion rate, latency p95s, errors, and preemptions —
-  multiple endpoints overlay as separate colored lines.
-  Fleet-wide KV is **capacity-weighted** when every endpoint exposes KV
-  capacity (`cache_config_info`), otherwise it is labelled
-  `unweighted mean (capacity unknown)` — percentages are never silently
-  averaged. Histogram data is never merged across endpoints unless bucket
-  boundaries match.
+- **Fleet (1)** — everything at a glance, three stacked sections. Top: a
+  dense per-endpoint table (health/staleness, model, running/waiting, KV
+  bar, prompt/generation throughput, completion rate, worst TTFT p95, new
+  errors/preemptions, data age). Middle: **past-30-days usage bar charts**
+  — output tokens/day, input tokens/day, requests/day, summed across the
+  fleet per local calendar day, read from the recorded history (see
+  [Recording](#recording)); bars size dynamically with the terminal, and
+  days without observations show `--`, never a fabricated zero. Bottom: a
+  scrollable grid of rolling history charts (default 5 min at 1 s
+  resolution) for running/waiting, KV usage, throughputs, completion rate,
+  latency p95s, errors, and preemptions — multiple endpoints overlay as
+  separate colored lines. Histogram data is never merged across endpoints
+  unless bucket boundaries match.
 - **Endpoint (2…N)** — one server in depth. A pulse strip answers the first
   question at a glance: an animated `GENERATING` indicator while requests
   are running, generation/prompt tokens/s with session peaks (`pk`),
@@ -161,12 +167,39 @@ redacted (no userinfo or query strings).
   odometer (`tokens 5.4M in / 1.2M out` — prompt tokens consumed / tokens
   generated since the server started), and a full-width KV-cache bar with
   absolute tokens that visibly grows while a conversation generates.
-  Below it: cache hit rates, finish reasons, errors/aborts, preemptions,
-  the latency percentile table (TTFT, inter-token, e2e, queue, prefill,
-  decode; p50/p95/p99/mean over a rolling window) plus tokens-per-request
-  distributions, and trend charts. Multi-engine (data-parallel) or
-  multi-model servers keep separate per-series rows, including per-model
-  lifetime token totals.
+  Below it, by default: **prefill and generation token-rate charts** (live
+  rate in each header) on the left, and the **requests pane** (see below)
+  on the right. Press `t` for the classic tables: cache hit rates, finish
+  reasons, errors/aborts, preemptions, the latency percentile table (TTFT,
+  inter-token, e2e, queue, prefill, decode; p50/p95/p99/mean over a rolling
+  window) plus tokens-per-request distributions, and trend charts.
+  Multi-engine (data-parallel) or multi-model servers keep separate
+  per-series rows, including per-model lifetime token totals.
+
+### Requests pane (log tailing)
+
+vLLM's HTTP API exposes no per-request information, so the requests pane
+(age, prompt preview, request id, max_tokens) works by **tailing the vLLM
+server's stdout log** — opt-in, per endpoint, local files only:
+
+```toml
+[[endpoints]]
+name = "local"
+url  = "http://127.0.0.1:8000"
+log_file = "/var/log/vllm/server.log"   # tail -f semantics: new requests only
+```
+
+Requirements on the vLLM side: start the server with
+`--enable-log-requests` (request ids + params appear at INFO); prompt
+previews additionally need `VLLM_LOGGING_LEVEL=DEBUG`, otherwise the prompt
+column shows `--`.
+
+Privacy guarantees: prompt previews are truncated to 120 bytes, kept only
+in a bounded in-memory ring (200 entries), and are **never** written to the
+SQLite recorder, tracing logs, or any file. Tailing starts at the end of
+the file (like `tail -f`), reads are bounded per tick, and rotation and
+truncation are handled. vllmtop still never proxies, inspects, or modifies
+inference traffic.
 
 ### Data semantics worth knowing
 
@@ -198,10 +231,16 @@ redacted (no userinfo or query strings).
 
 ### Recording
 
-`--record PATH` appends aggregate samples (endpoint, model, engine, metric
-id, value, wall timestamp) to a SQLite database in WAL mode — the same
-curated series the fleet charts display. Never prompts, request bodies,
-tokens, or headers. Retention defaults to 30 days (`--retention-days`,
+Recording is **on by default**: aggregate samples (endpoint, model, engine,
+metric id, value, wall timestamp) append to a SQLite database in WAL mode at
+`$XDG_DATA_HOME/vllmtop/usage.db` (falling back to
+`~/.local/share/vllmtop/usage.db`). `--record PATH` (or `record_path` in the
+config file) changes the location; `--no-record` (or `no_record = true`)
+turns it off — which also empties the fleet daily-usage charts, since they
+are computed from this database (cumulative token/request counters are
+snapshotted every 30 s and aggregated into per-local-day totals with
+restart-aware positive deltas). Never prompts, request bodies, tokens, or
+headers. Retention defaults to 30 days (`--retention-days`,
 `retention_days`), cleaned up in bounded batches. Writes happen on a
 dedicated thread; if the database stalls, batches are dropped and counted
 (shown in the header) rather than ever blocking collection. The header's

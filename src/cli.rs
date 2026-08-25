@@ -26,9 +26,15 @@ pub struct Cli {
     #[arg(long, value_name = "PATH")]
     pub config: Option<PathBuf>,
 
-    /// Record metric history to this SQLite database (off unless given).
+    /// Record metric history to this SQLite database
+    /// (default: $XDG_DATA_HOME/vllmtop/usage.db).
     #[arg(long, value_name = "PATH")]
     pub record: Option<PathBuf>,
+
+    /// Disable recording entirely (also disables the fleet daily-usage
+    /// charts, which read from the recorded history).
+    #[arg(long, conflicts_with = "record")]
+    pub no_record: bool,
 
     /// Refresh interval in milliseconds (min 1000, max 60000).
     #[arg(long, value_name = "MS")]
@@ -85,5 +91,11 @@ mod tests {
     fn cli_definition_is_consistent() {
         use clap::CommandFactory;
         Cli::command().debug_assert();
+    }
+
+    #[test]
+    fn no_record_conflicts_with_record() {
+        assert!(Cli::try_parse_from(["vllmtop", "--no-record", "--record", "/tmp/x.db"]).is_err());
+        assert!(Cli::try_parse_from(["vllmtop", "--no-record"]).is_ok());
     }
 }

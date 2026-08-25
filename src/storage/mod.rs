@@ -1,4 +1,5 @@
-//! Optional SQLite recording of aggregate metric samples.
+//! SQLite recording of aggregate metric samples (on by default; opt out
+//! with `--no-record`).
 //!
 //! Design constraints (docs/PLAN.md):
 //! - Runs on a dedicated OS thread; SQLite never touches tokio workers or
@@ -10,6 +11,10 @@
 //!   bodies, tokens, or headers.
 //! - Retention cleanup runs periodically in the same thread, batched so it
 //!   cannot hold long locks.
+//! - Reads (the daily-usage query in [`usage`]) happen on a separate
+//!   read-only connection; WAL keeps them from ever blocking the writer.
+
+pub mod usage;
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -64,6 +69,11 @@ impl Recorder {
     /// Open (or create) the database and start the writer thread. Errors here
     /// are fatal for recording only; the caller shows them and continues.
     pub fn start(path: &Path, retention_days: u32) -> Result<Recorder, String> {
+        // The default data-dir path may not exist yet (first run).
+        if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+            std::fs::create_dir_all(parent)
+                .map_err(|e| format!("create {}: {e}", parent.display()))?;
+        }
         let conn = open_database(path)?;
         let (tx, rx) = std::sync::mpsc::sync_channel::<Msg>(QUEUE_CAPACITY);
         let dropped = Arc::new(AtomicU64::new(0));
@@ -160,7 +170,11 @@ fn init_schema_sql(conn: &Connection) -> rusqlite::Result<()> {
          );
          CREATE INDEX IF NOT EXISTS idx_samples_ts ON samples (ts_ms);
          CREATE INDEX IF NOT EXISTS idx_samples_ep_metric_ts
-             ON samples (endpoint, metric, ts_ms);",
+             ON samples (endpoint, metric, ts_ms);
+         -- Serves the daily-usage query (metric IN (...) AND ts_ms >= ...).
+         -- Additive indexes never bump SCHEMA_VERSION.
+         CREATE INDEX IF NOT EXISTS idx_samples_metric_ts
+             ON samples (metric, ts_ms);",
     )
 }
 

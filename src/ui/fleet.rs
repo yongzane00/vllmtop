@@ -1,140 +1,184 @@
-//! Tab 1: fleet overview — totals, the endpoint table, and the rolling
-//! history charts in one view (PgUp/PgDn scrolls the chart grid).
+//! Tab 1: fleet overview — the endpoint table, the past-30-days usage bar
+//! charts, and the rolling history charts (PgUp/PgDn scrolls the grid).
 
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Cell, Paragraph, Row, Table};
+use ratatui::widgets::{Bar, BarChart, BarGroup, Block, Borders, Cell, Paragraph, Row, Table};
 use std::time::Instant;
 
 use crate::app::App;
-use crate::state::{Freshness, KvAggregate, aggregate_kv};
+use crate::state::Freshness;
+use crate::storage::usage::{DayUsage, USAGE_WINDOW_DAYS};
 use crate::ui::{format, freshness_badge};
 
 /// A chart row needs this many terminal rows to be readable; below that the
 /// charts section is dropped and the table gets everything.
 const MIN_CHART_ROWS: u16 = 8;
+/// The daily-usage bar section needs at least this many rows to read.
+const MIN_USAGE_ROWS: u16 = 7;
 
 pub fn draw(frame: &mut Frame, app: &App, area: Rect) {
-    let [summary_area, rest] =
-        Layout::vertical([Constraint::Length(4), Constraint::Min(0)]).areas(area);
-    draw_summary(frame, app, summary_area);
-
     // Table gets exactly what it needs (header + one row per endpoint, at
-    // most half the space); the history charts take the remainder when at
-    // least one chart row fits.
+    // most half the space). Below it: daily usage bars, then the rolling
+    // chart grid. Degrade order as the terminal shrinks: grid first, then
+    // the usage bars, the table last.
     let table_needed = (app.endpoints.len() as u16).saturating_add(1);
-    let table_h = table_needed.min((rest.height / 2).max(1));
-    if rest.height.saturating_sub(table_h) >= MIN_CHART_ROWS {
-        let [table_area, charts_area] =
-            Layout::vertical([Constraint::Length(table_h), Constraint::Min(0)]).areas(rest);
+    let table_h = table_needed.min((area.height / 2).max(1));
+    let rest = area.height.saturating_sub(table_h);
+    let usage_h = (rest / 3).clamp(MIN_USAGE_ROWS, 12);
+
+    if rest >= usage_h + MIN_CHART_ROWS {
+        let [table_area, usage_area, charts_area] = Layout::vertical([
+            Constraint::Length(table_h),
+            Constraint::Length(usage_h),
+            Constraint::Min(0),
+        ])
+        .areas(area);
         draw_table(frame, app, table_area);
+        draw_daily_usage(frame, app, usage_area);
         super::charts::draw_grid(frame, app, charts_area, app.fleet_chart_scroll);
+    } else if rest >= MIN_USAGE_ROWS {
+        let [table_area, usage_area] =
+            Layout::vertical([Constraint::Length(table_h), Constraint::Min(0)]).areas(area);
+        draw_table(frame, app, table_area);
+        draw_daily_usage(frame, app, usage_area);
     } else {
-        draw_table(frame, app, rest);
+        draw_table(frame, app, area);
     }
 }
 
-fn draw_summary(frame: &mut Frame, app: &App, area: Rect) {
+/// The past-30-days usage section: three bar charts (output tokens, input
+/// tokens, requests per local day), fleet-wide, fed by the recorded history.
+fn draw_daily_usage(frame: &mut Frame, app: &App, area: Rect) {
     let t = &app.theme;
-    let now = Instant::now();
 
-    let mut healthy = 0usize;
-    let mut running: Option<f64> = None;
-    let mut waiting: Option<f64> = None;
-    let mut prompt: Option<f64> = None;
-    let mut generation: Option<f64> = None;
-    let mut completions: Option<f64> = None;
-    // (usage, capacity) per series across the whole fleet for KV aggregation.
-    let mut kv_pairs: Vec<(f64, Option<f64>)> = Vec::new();
+    // No data cases explain themselves instead of showing empty axes.
+    let mut note = |text: String, style| {
+        let block = Block::new()
+            .borders(Borders::TOP)
+            .border_style(t.dim)
+            .title(Span::styled(" daily usage (30d) ", t.heading));
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(text, style))).block(block),
+            area,
+        );
+    };
+    if let Some(reason) = &app.usage.disabled {
+        note(format!(" usage history off — {reason}"), t.na);
+        return;
+    }
+    let Some(data) = &app.usage.data else {
+        match &app.usage.last_error {
+            Some(e) => note(format!(" usage query failed: {e}"), t.crit),
+            None => note(" loading usage history…".into(), t.na),
+        }
+        return;
+    };
 
-    for e in &app.endpoints {
-        let fresh = e.freshness(now, app.refresh_interval) == Freshness::Fresh;
-        if fresh && e.healthy != Some(false) {
-            healthy += 1;
+    type Getter = fn(&DayUsage) -> Option<f64>;
+    let specs: [(&str, Getter); 3] = [
+        ("output tokens/day", |d| d.generation_tokens),
+        ("input tokens/day", |d| d.prompt_tokens),
+        ("requests/day", |d| d.requests),
+    ];
+
+    // Three side-by-side charts when wide, stacked when narrow.
+    if area.width >= 100 {
+        let [a, b, c] = Layout::horizontal([Constraint::Ratio(1, 3); 3]).areas(area);
+        for ((title, get), cell) in specs.into_iter().zip([a, b, c]) {
+            draw_usage_chart(frame, app, cell, title, get, &data.days);
         }
-        // Totals only include fresh data: a stale snapshot must not inflate
-        // fleet activity silently.
-        if !fresh {
-            continue;
+    } else {
+        let h = (area.height / 3).max(3);
+        let [a, b, c] = Layout::vertical([
+            Constraint::Length(h),
+            Constraint::Length(h),
+            Constraint::Min(0),
+        ])
+        .areas(area);
+        for ((title, get), cell) in specs.into_iter().zip([a, b, c]) {
+            draw_usage_chart(frame, app, cell, title, get, &data.days);
         }
-        let agg = e.aggregate();
-        sum(&mut running, agg.running);
-        sum(&mut waiting, agg.waiting);
-        sum(&mut prompt, agg.prompt_tps);
-        sum(&mut generation, agg.generation_tps);
-        sum(&mut completions, agg.request_rate);
-        if let Some(curated) = &e.curated {
-            for series in curated.series.values() {
-                if let Some(usage) = series.kv_cache_usage {
-                    kv_pairs.push((usage, series.kv_cache_size_tokens));
+    }
+}
+
+fn draw_usage_chart(
+    frame: &mut Frame,
+    app: &App,
+    area: Rect,
+    title: &str,
+    get: fn(&DayUsage) -> Option<f64>,
+    days: &[DayUsage],
+) {
+    let t = &app.theme;
+    let inner_w = area.width.saturating_sub(2) as usize; // block borders
+
+    // Bars size dynamically with the terminal: wide terminals get wider
+    // bars with gaps; narrow ones pack width-1 bars and, when even those
+    // cannot fit, show only the most recent days (labelled below).
+    let per = (inner_w / USAGE_WINDOW_DAYS).max(1);
+    let (bar_width, bar_gap) = if per >= 3 { (per - 1, 1) } else { (per, 0) };
+    let fit = (inner_w / (bar_width + bar_gap).max(1))
+        .clamp(1, USAGE_WINDOW_DAYS)
+        .min(days.len());
+    let shown = &days[days.len() - fit..];
+
+    let total: Option<f64> = shown
+        .iter()
+        .filter_map(get)
+        .fold(None, |acc: Option<f64>, v| Some(acc.unwrap_or(0.0) + v));
+    let mut title_spans = vec![Span::styled(format!(" {title} "), t.heading)];
+    title_spans.push(Span::styled(format!("Σ {}", format::count(total)), t.value));
+    if fit < USAGE_WINDOW_DAYS {
+        title_spans.push(Span::styled(format!(" (last {fit}d)"), t.dim));
+    }
+    title_spans.push(Span::raw(" "));
+
+    let block = Block::new()
+        .borders(Borders::ALL)
+        .border_style(t.dim)
+        .title(Line::from(title_spans));
+
+    let bars: Vec<Bar> = shown
+        .iter()
+        .map(|d| {
+            let day_of_month = d.day.get(8..10).unwrap_or("");
+            let mut bar = Bar::default();
+            match get(d) {
+                Some(v) => {
+                    bar = bar.value(v.round().max(0.0) as u64).style(t.value);
+                    // Value text only when the bar is wide enough to carry it.
+                    if bar_width < 5 {
+                        bar = bar.text_value(String::new());
+                    } else {
+                        bar = bar.text_value(format::count(Some(v)));
+                    }
+                }
+                // Unobserved day: zero-height bar, explicitly marked, never
+                // a fabricated zero.
+                None => {
+                    bar = bar.value(0).style(t.na);
+                    bar = bar.text_value(if bar_width >= 2 {
+                        "--".into()
+                    } else {
+                        String::new()
+                    });
                 }
             }
-        }
-    }
+            if bar_width >= 2 {
+                bar = bar.label(Line::from(Span::styled(day_of_month.to_string(), t.dim)));
+            }
+            bar
+        })
+        .collect();
 
-    let kv_span: Vec<Span> = match aggregate_kv(&kv_pairs) {
-        Some(KvAggregate::CapacityWeighted(v)) => vec![
-            Span::styled(format::percent(Some(v)), t.by_level(v, 0.75, 0.9)),
-            Span::styled(" capacity-weighted", t.dim),
-        ],
-        Some(KvAggregate::UnweightedMean(v)) => vec![
-            Span::styled(format::percent(Some(v)), t.by_level(v, 0.75, 0.9)),
-            Span::styled(" unweighted mean (capacity unknown)", t.warn),
-        ],
-        None => vec![Span::styled(format::NA, t.na)],
-    };
-
-    let n = app.endpoints.len();
-    let health_style = if healthy == n {
-        t.value
-    } else if healthy == 0 {
-        t.crit
-    } else {
-        t.warn
-    };
-
-    let lines = vec![
-        Line::from(vec![
-            Span::styled(" FLEET ", t.heading),
-            Span::styled(format!("{healthy}/{n} healthy"), health_style),
-            Span::styled("   running ", t.dim),
-            Span::styled(format::count(running), t.value),
-            Span::styled("   waiting ", t.dim),
-            styled_waiting(app, waiting),
-            Span::styled("   completions ", t.dim),
-            Span::styled(format::rate(completions), t.value),
-        ]),
-        Line::from(vec![
-            Span::styled("        prompt ", t.dim),
-            Span::styled(format!("{} tokens/s", format::count(prompt)), t.value),
-            Span::styled("   generation ", t.dim),
-            Span::styled(format!("{} tokens/s", format::count(generation)), t.value),
-        ]),
-        Line::from([vec![Span::styled("        fleet KV ", t.dim)], kv_span].concat()),
-    ];
-    frame.render_widget(
-        Paragraph::new(lines).block(
-            Block::new()
-                .borders(Borders::BOTTOM)
-                .border_style(app.theme.dim),
-        ),
-        area,
-    );
-}
-
-fn styled_waiting(app: &App, waiting: Option<f64>) -> Span<'static> {
-    let t = &app.theme;
-    match waiting {
-        Some(w) if w > 0.0 => Span::styled(format::count(waiting), t.warn),
-        _ => Span::styled(format::count(waiting), t.value),
-    }
-}
-
-fn sum(acc: &mut Option<f64>, v: Option<f64>) {
-    if let Some(v) = v {
-        *acc = Some(acc.unwrap_or(0.0) + v);
-    }
+    let chart = BarChart::default()
+        .block(block)
+        .bar_width(bar_width as u16)
+        .bar_gap(bar_gap as u16)
+        .data(BarGroup::default().bars(&bars));
+    frame.render_widget(chart, area);
 }
 
 fn draw_table(frame: &mut Frame, app: &App, area: Rect) {

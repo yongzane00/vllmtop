@@ -17,6 +17,7 @@ const BINDINGS: &[(&str, &str)] = &[
     ("PgUp/PgDn / wheel", "scroll the history charts"),
     ("g / G", "jump to top / last row"),
     ("s", "cycle fleet sort column"),
+    ("t", "endpoint view: toggle charts+requests / tables"),
     ("r", "force refresh now"),
     ("p", "pause display refresh (collection continues)"),
     ("+ / -", "faster / slower refresh interval"),
