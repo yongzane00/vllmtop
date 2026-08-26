@@ -64,9 +64,14 @@ that keep them from coming back. Ordered by layer, not chronology.
   the new field invisible — no error, no wrap, just gone. Measure a line's
   worst case before appending to it; if it doesn't fit, restructure (the
   pulse strip became three lines).
-- **Absent ≠ zero must survive into charts**: unobserved days render a
-  zero-height bar *styled as unavailable with a `--` text value*, not a
-  zero-height bar that looks like "no traffic".
+- **Absent ≠ zero must survive into charts — and widgets can defeat it.**
+  ratatui's `BarChart` renders nothing for zero-height bars (absent-day
+  `--` markers silently vanished) and its per-bar labels fuse into an
+  unreadable digit wall at 30 narrow bars. The fix was a hand-rendered
+  tape: bars for observed days, a dim low mark for measured zeros, a faint
+  baseline dot for unobserved days, and sparse relative date ticks
+  (`-5d … today`). Verify chart honesty against a *sparse* dataset (day
+  one of recording), not just a dense demo.
 - **Dynamic sizing beats clever clipping**: bar width derives from the
   area every frame; when 30 days can't fit, show the last N and label it
   `(last Nd)` in the title rather than cropping silently.

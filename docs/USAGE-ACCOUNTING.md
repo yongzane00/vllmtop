@@ -102,14 +102,23 @@ in `tokio::task::spawn_blocking`, and the result arrives as
 disabled shows *why* (`--no-record`, unresolvable default path, or recorder
 startup failure) instead of empty axes.
 
-## Rendering rules (`draw_daily_usage`)
+## Rendering rules (`draw_usage_chart`)
 
+The tape is hand-rendered (ratatui's `BarChart` draws nothing for
+zero-height bars, which made absent days indistinguishable from broken
+ones, and its per-bar labels fuse into a digit wall at 30 bars):
+
+- **Every slot is visibly accounted for**: observed days draw eighth-block
+  bars (`▁▂▃▄▅▆▇█`, minimum `▁` for any non-zero value), a measured zero
+  draws a dim low mark, an unobserved day draws a faint baseline dot.
+  ASCII theme falls back to `#` / `_` / `.`.
 - Bars size dynamically: `bar_width = max(1, inner_width/30 − gap)`, gap 1
   only when ≥ 3 cells per day. If even width-1 bars don't fit 30 days, the
-  most recent N days render and the title says `(last Nd)` — never a
+  most recent N days render and the title says `last Nd` — never a
   silently cropped axis.
-- Unobserved days draw a zero-height bar styled as unavailable with a `--`
-  text value; per-bar value labels appear only at `bar_width ≥ 5`,
-  day-of-month labels at `≥ 2`.
-- Titles carry the window total (`Σ 8.85M`) computed only from observed
-  days.
+- **Date ticks every 5 days, anchored on today**, in the rolling charts'
+  relative vocabulary: `-25d … -10d -5d today` (today's tick accented).
+  Ticks that would collide are skipped, never overlapped.
+- Titles carry the window total (`Σ 8.85M`, observed days only) and the
+  y-scale (`pk 1.2M` — bars are normalized to the busiest shown day).
+  The `today` tick always wins placement; older ticks yield to it.
