@@ -4,11 +4,9 @@
 #   vllmtop-vX.Y.Z-<target>.tar.gz  +  .sha256
 # to a GitHub release.
 #
-# RELEASE BLOCKER: this workflow is repo-agnostic (uses GITHUB_TOKEN and the
-# repository it runs in), but it cannot be exercised until the project has a
-# public repository, and the README install instructions + scripts/install.sh
-# need the final owner/name. Verify an aarch64 release binary on real ARM64
-# hardware before announcing support.
+# The workflow is repo-agnostic (uses GITHUB_TOKEN and the repository it
+# runs in). Before announcing aarch64 support, verify a release binary on
+# real ARM64 hardware at least once.
 
 name: Release
 

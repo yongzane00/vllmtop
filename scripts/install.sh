@@ -2,16 +2,11 @@
 # vllmtop installer: downloads a release binary, verifies its SHA-256, and
 # installs it to ~/.local/bin (no root needed).
 #
-# RELEASE BLOCKER — NOT YET FUNCTIONAL AS A ONE-LINER:
-# The GitHub owner/repository is not decided, so this script takes the repo
-# as a parameter instead of hardcoding a fake one. Once the repository
-# exists, bake its slug into VLLMTOP_REPO's default below and publish the
-# usual `curl | sh` one-liner. Until then:
-#
-#   VLLMTOP_REPO=owner/vllmtop sh scripts/install.sh [VERSION]
+# Usage:
+#   sh scripts/install.sh [VERSION]
 #
 # Options (environment variables):
-#   VLLMTOP_REPO      GitHub "owner/name" slug. REQUIRED until a default is baked in.
+#   VLLMTOP_REPO      GitHub "owner/name" slug (default: yongzane00/vllmtop).
 #   VLLMTOP_PREFIX    Install directory (default: ~/.local/bin).
 #   VLLMTOP_VERSION   Tag to install, e.g. v0.1.0 (default: latest release).
 #
@@ -19,15 +14,11 @@
 
 set -eu
 
-REPO="${VLLMTOP_REPO:-}"
+REPO="${VLLMTOP_REPO:-yongzane00/vllmtop}"
 PREFIX="${VLLMTOP_PREFIX:-$HOME/.local/bin}"
 VERSION="${VLLMTOP_VERSION:-${1:-}}"
 
 err() { printf 'install.sh: %s\n' "$*" >&2; exit 1; }
-
-[ -n "$REPO" ] || err "VLLMTOP_REPO is not set. The vllmtop repository location
-is not finalized yet; pass it explicitly, e.g.:
-  VLLMTOP_REPO=owner/vllmtop sh scripts/install.sh"
 
 command -v curl >/dev/null 2>&1 || err "curl is required"
 command -v tar  >/dev/null 2>&1 || err "tar is required"
