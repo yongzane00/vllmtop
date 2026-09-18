@@ -53,6 +53,49 @@ impl FleetSort {
     }
 }
 
+/// What the endpoint view shows BELOW its card band. `t` cycles it.
+///
+/// Deliberately one global setting rather than one per endpoint: it is a
+/// lens preference ("show me the latency tables"), not a property of a
+/// machine. With `Tab` cycling a dozen endpoints, a per-endpoint mode would
+/// change the screen's shape as you move between them — the worst property
+/// for a glance tool. (If it is ever wanted per endpoint, this becomes a
+/// `Vec<PanelMode>` behind an accessor; `endpoint::draw` already takes the
+/// index.)
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum PanelMode {
+    /// The six live charts.
+    #[default]
+    Overview,
+    /// Token-rate charts beside the live request log.
+    Requests,
+    /// The ACTIVITY / LATENCY percentile tables.
+    Tables,
+}
+
+impl PanelMode {
+    pub fn next(self) -> Self {
+        match self {
+            PanelMode::Overview => PanelMode::Requests,
+            PanelMode::Requests => PanelMode::Tables,
+            PanelMode::Tables => PanelMode::Overview,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            PanelMode::Overview => "overview",
+            PanelMode::Requests => "requests",
+            PanelMode::Tables => "tables",
+        }
+    }
+
+    /// What pressing `t` gives you next — what the footer advertises.
+    pub fn next_label(self) -> &'static str {
+        self.next().label()
+    }
+}
+
 /// Record cumulative counter snapshots at most this often (per endpoint).
 /// One cadence bounds the error at day boundaries and restarts; 30 s keeps
 /// the usage rows ~0.3% of the recorder's volume.
@@ -82,9 +125,8 @@ pub struct App {
     pub fleet_chart_scroll: usize,
     pub paused: bool,
     pub show_help: bool,
-    /// Endpoint view: `false` = charts + requests pane (default), `true` =
-    /// the ACTIVITY/LATENCY tables ('t' toggles).
-    pub endpoint_tables: bool,
+    /// What the endpoint view shows below its cards ('t' cycles).
+    pub panel_mode: PanelMode,
     /// Runtime-adjustable; starts at config.refresh_interval.
     pub refresh_interval: Duration,
     pub recorder: Option<Recorder>,
@@ -148,7 +190,7 @@ impl App {
             fleet_chart_scroll: 0,
             paused: false,
             show_help: false,
-            endpoint_tables: false,
+            panel_mode: PanelMode::default(),
             recorder,
             recorder_error,
             usage: UsageCache {
@@ -416,9 +458,13 @@ impl App {
             KeyCode::Char('p') => self.paused = !self.paused,
             KeyCode::Char('t') => {
                 if matches!(self.view, View::Endpoint(_)) {
-                    self.endpoint_tables = !self.endpoint_tables;
+                    self.panel_mode = self.panel_mode.next();
                 }
             }
+            // Tab aliases, matching the arrow keys people expect in a tabbed
+            // TUI. `j`/`k`/Up/Down keep row selection.
+            KeyCode::Right => self.view = self.next_view(self.view),
+            KeyCode::Left => self.view = self.prev_view(self.view),
             // '+' = faster refresh = SHORTER interval (matches README).
             KeyCode::Char('+') | KeyCode::Char('=') => self.adjust_interval(-1),
             KeyCode::Char('-') => self.adjust_interval(1),
@@ -557,14 +603,13 @@ impl App {
     }
 }
 
+/// Shared test fixtures. `cfg(test)` only, so nothing ships in the binary.
 #[cfg(test)]
-mod tests {
+pub(crate) mod testing {
     use super::*;
-    use crate::collector::CollectorControl;
-    use crate::config::Config;
-    use tokio::sync::watch;
 
-    fn test_app(endpoint_urls: &[&str]) -> App {
+    /// `n` endpoints, mono theme, no recorder.
+    pub(crate) fn app_with(endpoint_urls: &[&str]) -> App {
         use clap::Parser;
         let mut args = vec!["vllmtop".to_string()];
         for (i, u) in endpoint_urls.iter().enumerate() {
@@ -573,8 +618,8 @@ mod tests {
         }
         let cli = crate::cli::Cli::parse_from(args);
         let config: Config = crate::config::load(&cli, |_| None).unwrap();
-        let (interval_tx, _rx) = watch::channel(config.refresh_interval);
-        let (force_tx, _rx2) = watch::channel(0);
+        let (interval_tx, _rx) = tokio::sync::watch::channel(config.refresh_interval);
+        let (force_tx, _rx2) = tokio::sync::watch::channel(0);
         let control = CollectorControl {
             interval_tx,
             force_tx,
@@ -584,6 +629,64 @@ mod tests {
         let (events_tx, _events_rx) = mpsc::channel(8);
         App::new(config, Theme::mono(), control, events_tx)
     }
+
+    /// Two scrapes 2 s apart of the real (sanitized) vLLM capture, so rates,
+    /// percentile windows and history rings all hold real values. The second
+    /// scrape advances the counters, which is what makes rates non-`None`.
+    pub(crate) fn app_with_fixture(endpoint_urls: &[&str]) -> App {
+        const FIXTURE: &str = include_str!("../tests/fixtures/vllm_0_24_single_engine.txt");
+        let mut app = app_with(endpoint_urls);
+        let base = Instant::now();
+        for (i, offset) in [0.0_f64, 2.0].into_iter().enumerate() {
+            // Bump every counter on the second pass so deltas exist.
+            let text = if i == 0 {
+                FIXTURE.to_string()
+            } else {
+                bump_counters(FIXTURE)
+            };
+            for endpoint in 0..app.endpoints.len() {
+                app.handle_event(AppEvent::Scrape {
+                    endpoint,
+                    outcome: crate::state::ScrapeOutcome {
+                        at: base + Duration::from_secs_f64(offset),
+                        wall: std::time::SystemTime::now(),
+                        duration: Duration::from_millis(10),
+                        result: Ok(crate::state::ScrapePayload {
+                            metrics: Some(crate::metrics::parse::parse_text(&text)),
+                            ..Default::default()
+                        }),
+                    },
+                });
+            }
+        }
+        app
+    }
+
+    /// Scale every numeric sample up by 10%, so the second scrape of a
+    /// fixture produces positive counter deltas.
+    fn bump_counters(text: &str) -> String {
+        text.lines()
+            .map(|line| {
+                if line.starts_with('#') || line.trim().is_empty() {
+                    return line.to_string();
+                }
+                match line.rsplit_once(' ') {
+                    Some((head, value)) => match value.parse::<f64>() {
+                        Ok(v) => format!("{head} {}", v * 1.1),
+                        Err(_) => line.to_string(),
+                    },
+                    None => line.to_string(),
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::testing::app_with as test_app;
+    use super::*;
 
     fn key(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::NONE)
@@ -630,16 +733,44 @@ mod tests {
     }
 
     #[test]
-    fn t_toggles_tables_only_in_endpoint_view() {
-        let mut app = test_app(&["http://h:1"]);
-        assert!(!app.endpoint_tables);
+    fn t_cycles_panel_modes_only_in_endpoint_view() {
+        let mut app = test_app(&["http://h:1", "http://h:2"]);
+        assert_eq!(app.panel_mode, PanelMode::Overview);
         app.handle_key(key(KeyCode::Char('t'))); // fleet view: no-op
-        assert!(!app.endpoint_tables);
+        assert_eq!(app.panel_mode, PanelMode::Overview);
+
         app.view = View::Endpoint(0);
         app.handle_key(key(KeyCode::Char('t')));
-        assert!(app.endpoint_tables);
+        assert_eq!(app.panel_mode, PanelMode::Requests);
         app.handle_key(key(KeyCode::Char('t')));
-        assert!(!app.endpoint_tables);
+        assert_eq!(app.panel_mode, PanelMode::Tables);
+        app.handle_key(key(KeyCode::Char('t')));
+        assert_eq!(app.panel_mode, PanelMode::Overview);
+    }
+
+    #[test]
+    fn panel_mode_is_global_so_tabbing_does_not_reshape_the_screen() {
+        let mut app = test_app(&["http://h:1", "http://h:2"]);
+        app.view = View::Endpoint(0);
+        app.handle_key(key(KeyCode::Char('t')));
+        assert_eq!(app.panel_mode, PanelMode::Requests);
+        app.handle_key(key(KeyCode::Tab));
+        assert_eq!(app.view, View::Endpoint(1));
+        assert_eq!(app.panel_mode, PanelMode::Requests);
+    }
+
+    #[test]
+    fn left_and_right_are_view_aliases_and_do_not_move_row_selection() {
+        let mut app = test_app(&["http://h:1", "http://h:2"]);
+        app.handle_key(key(KeyCode::Right));
+        assert_eq!(app.view, View::Endpoint(0));
+        assert_eq!(app.fleet_selected, 0);
+        app.handle_key(key(KeyCode::Left));
+        assert_eq!(app.view, View::Fleet);
+        // From the fleet, Left wraps to the last endpoint.
+        app.handle_key(key(KeyCode::Left));
+        assert_eq!(app.view, View::Endpoint(1));
+        assert_eq!(app.fleet_selected, 0);
     }
 
     #[test]
@@ -821,12 +952,18 @@ mod tests {
             endpoint: 0,
             healthy: Some(false),
             version: Some("1.2.3".into()),
-            models: Some(vec!["model-a".into()]),
+            models: Some(vec![crate::state::ServedModel {
+                id: "model-a".into(),
+                root: Some("/models/model-a".into()),
+                max_model_len: Some(262_144),
+            }]),
         });
         let endpoint = &app.endpoints[0];
         assert_eq!(endpoint.healthy, Some(false));
         assert_eq!(endpoint.vllm_version.as_deref(), Some("1.2.3"));
-        assert_eq!(endpoint.served_models, ["model-a"]);
+        assert_eq!(endpoint.served_models.len(), 1);
+        assert_eq!(endpoint.served_models[0].id, "model-a");
+        assert_eq!(endpoint.served_models[0].max_model_len, Some(262_144));
         assert_eq!(endpoint.total_scrapes, 0);
     }
 

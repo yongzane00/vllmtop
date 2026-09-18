@@ -16,10 +16,16 @@ only ever sends GET requests to endpoints vLLM already exposes.
 
 ![Fleet view](docs/img/fleet.svg)
 
-**Endpoint detail** — pulse strip, token-rate charts, live requests pane
-(press `t` for latency-percentile tables):
+**Endpoint detail** — status cards over live charts for throughput, queue
+depth, KV cache and latency, with percentiles, server/model facts and the
+live request log below:
 
 ![Endpoint view](docs/img/endpoint.svg)
+
+Press `t` to cycle the lower half: **requests** puts the live request log
+beside the token rates, **tables** brings up the latency percentiles.
+
+![Requests mode](docs/img/endpoint-requests.svg)
 
 *(Screenshots captured against local mock vLLM servers.)*
 
@@ -166,12 +172,12 @@ written anywhere. Log formats, parsing details, and the exact bounds are in
 | Key | Action |
 | --- | --- |
 | `q` / `Ctrl+C` | quit |
-| `Tab` / `Shift+Tab`, `1`…`9` | switch views (`1` is the fleet overview) |
+| `Tab` / `Shift+Tab`, `←`/`→`, `1`…`9` | switch views (`1` is the fleet overview) |
 | `j`/`k` or `↑`/`↓`, `Enter` | select / open endpoint (fleet view) |
 | `g` / `G` | jump to first / last row |
 | `PgUp`/`PgDn`, mouse wheel | scroll the history charts |
 | `s` | cycle fleet sort column |
-| `t` | endpoint view: charts+requests ⇄ latency tables |
+| `t` | endpoint view: cycle overview / requests / tables |
 | `r` | force refresh |
 | `p` | pause display (collection continues) |
 | `+` / `-` | faster / slower refresh |
@@ -217,6 +223,21 @@ Per-request visibility exists only through the local, opt-in
 
 ## Development
 
+Run it straight from the source tree while you work on it. Flags for
+vllmtop go after `--`, so cargo doesn't try to interpret them:
+
+```bash
+cargo run                                     # debug build, monitors 127.0.0.1:8000
+cargo run -- -e local=http://127.0.0.1:8000   # pass flags after --
+cargo run -- --no-record --no-color           # skip the usage database, plain theme
+cargo run --release -- --refresh-interval-ms 2000
+```
+
+A debug build is fine for the TUI, though `--release` renders noticeably
+more smoothly on large fleets.
+
+Before sending a change, all four of these must pass; CI enforces them:
+
 ```bash
 cargo fmt --all -- --check
 cargo clippy --all-targets --all-features -- -D warnings
@@ -224,9 +245,9 @@ cargo test --all-features
 cargo build --release
 ```
 
-All four are enforced in CI. See [CONTRIBUTING.md](CONTRIBUTING.md) for
-setup and conventions, and the [documentation index](docs/README.md) for
-architecture, metric semantics, and design notes under `docs/`.
+See [CONTRIBUTING.md](CONTRIBUTING.md) for setup and conventions, and the
+[documentation index](docs/README.md) for architecture, metric semantics,
+and design notes under `docs/`.
 
 ## License
 

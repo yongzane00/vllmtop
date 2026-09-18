@@ -6,217 +6,447 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Cell, Paragraph, Row, Table};
 use std::time::Instant;
 
-use crate::app::App;
+use crate::app::{App, PanelMode};
 use crate::metrics::normalize::{CuratedSeries, SeriesKey, hist};
 use crate::state::{DerivedSeries, EndpointState};
-use crate::ui::{format, freshness_badge};
+use crate::ui::{cards, charts, format, freshness_badge, panels};
+
+/// The overview detail band needs this many rows to be worth drawing.
+const MIN_LOWER_H: u16 = 8;
+const MAX_LOWER_H: u16 = 12;
 
 pub fn draw(frame: &mut Frame, app: &App, index: usize, area: Rect) {
     let Some(e) = app.endpoints.get(index) else {
         return;
     };
-    let [head, pulse, body] = Layout::vertical([
-        Constraint::Length(3),
-        Constraint::Length(4),
+    let cards = endpoint_cards(app, index, e);
+    let grid = cards::card_grid(area.width, cards.len());
+    let head_h = 3.min(area.height);
+    let avail = area.height.saturating_sub(head_h);
+    // The card band never takes more than a third of the view, so the panels
+    // below always keep room.
+    let max_cards_h = (avail / 3 / cards::CARD_H) * cards::CARD_H;
+    let cards_h = grid.height.min(max_cards_h);
+    let life_h = u16::from(cards_h > 0 && avail > cards_h + 1);
+
+    let [head, cards_area, life, body] = Layout::vertical([
+        Constraint::Length(head_h),
+        Constraint::Length(cards_h),
+        Constraint::Length(life_h),
         Constraint::Min(0),
     ])
     .areas(area);
-    draw_head(frame, app, e, head);
-    draw_pulse(frame, app, index, e, pulse);
 
-    if app.endpoint_tables {
-        // 't' view: the ACTIVITY/LATENCY tables, charts below when roomy.
-        if body.height >= 14 {
-            let [tables, charts] =
-                Layout::vertical([Constraint::Percentage(62), Constraint::Percentage(38)])
-                    .areas(body);
-            draw_tables(frame, app, e, tables);
-            draw_trends(frame, app, e, charts);
-        } else {
-            draw_tables(frame, app, e, body);
+    draw_head(frame, app, e, head);
+    if cards_h > 0 {
+        cards::draw_card_row(frame, &app.theme, cards_area, &cards);
+    }
+    if life_h > 0 {
+        draw_lifetime(frame, app, e, life);
+    }
+
+    match app.panel_mode {
+        // The six live charts, plus the detail band when there is room.
+        PanelMode::Overview => draw_chart_band(frame, app, index, e, body),
+        // Token-rate charts beside the live request log.
+        PanelMode::Requests => {
+            if body.width >= 100 {
+                let [left, right] = Layout::horizontal([Constraint::Percentage(50); 2]).areas(body);
+                draw_rate_charts(frame, app, e, left);
+                draw_requests(frame, app, index, e, right);
+            } else {
+                // Too narrow to split: the request log is the point of this
+                // mode, so it gets the space.
+                draw_requests(frame, app, index, e, body);
+            }
         }
-    } else {
-        // Default view: token-rate charts left, live requests pane right.
-        let [left, right] = Layout::horizontal([Constraint::Percentage(50); 2]).areas(body);
-        draw_rate_charts(frame, app, e, left);
-        draw_requests(frame, app, index, e, right);
+        // The percentile tables, with trend charts below when roomy.
+        PanelMode::Tables => {
+            if body.height >= 14 {
+                let [tables, charts] =
+                    Layout::vertical([Constraint::Percentage(62), Constraint::Percentage(38)])
+                        .areas(body);
+                draw_tables(frame, app, e, tables);
+                draw_trends(frame, app, e, charts);
+            } else {
+                draw_tables(frame, app, e, body);
+            }
+        }
     }
 }
 
-/// The "is it alive and how fast" strip: an animated GENERATING indicator,
-/// the two token rates, running (as an `n/max` bar when the config declares
-/// the server's `--max-num-seqs`), waiting, lifetime completions served, and
-/// a full-width KV-cache bar that visibly grows while a conversation is
-/// being generated.
-fn draw_pulse(frame: &mut Frame, app: &App, index: usize, e: &EndpointState, area: Rect) {
-    let t = &app.theme;
-    let ascii = t.mode == crate::ui::theme::ColorMode::Mono;
-    let agg = e.aggregate();
-    let generating = agg.running.unwrap_or(0.0) > 0.0;
-
-    // Status with a spinner while requests are running. The UI redraws at
-    // least every 500 ms tick, so the animation runs at ~2 fps — enough to
-    // read as "alive". (Display-only wall-clock use.)
-    let mut line1: Vec<Span> = Vec::new();
-    if generating {
-        let frames: &[&str] = if ascii {
-            &["|", "/", "-", "\\"]
-        } else {
-            &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
-        };
-        let ms = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis();
-        let glyph = frames[(ms / 250) as usize % frames.len()];
-        line1.push(Span::styled(format!(" {glyph} GENERATING"), t.value));
+/// The overview band: up to six charts, 3 columns when wide, 2 at 100+, 1
+/// below. Rows come from the height, so a short terminal simply shows fewer.
+fn draw_chart_band(frame: &mut Frame, app: &App, index: usize, e: &EndpointState, area: Rect) {
+    let cols = if area.width >= 150 {
+        3
+    } else if area.width >= 100 {
+        2
     } else {
-        line1.push(Span::styled(" · IDLE      ", t.dim));
+        1
+    };
+    let specs = chart_specs(e);
+    let chart_rows = specs.len().div_ceil(cols) as u16;
+
+    // The detail band never costs a chart row: it appears only with height
+    // left over after every chart row has its minimum.
+    let needed_for_charts = chart_rows * charts::MIN_CHART_H;
+    let lower_h = if area.height >= needed_for_charts + MIN_LOWER_H {
+        (area.height - needed_for_charts).clamp(MIN_LOWER_H, MAX_LOWER_H)
+    } else {
+        0
+    };
+    let [charts_area, lower] =
+        Layout::vertical([Constraint::Min(0), Constraint::Length(lower_h)]).areas(area);
+
+    let cells = charts::grid_cells(charts_area, cols, specs.len());
+    for (spec, cell) in specs.iter().zip(cells) {
+        charts::draw_single_chart(frame, app, cell, e, spec);
     }
-    line1.push(Span::styled("   generation ", t.dim));
-    line1.push(Span::styled(
-        format!("{} tokens/s", format::count(agg.generation_tps)),
-        t.value,
-    ));
-    if let Some(pk) = e.peak_generation_tps {
-        line1.push(Span::styled(
-            format!(" (pk {})", format::count(Some(pk))),
+    if lower_h > 0 {
+        draw_lower(frame, app, index, e, lower);
+    }
+}
+
+/// Detail band under the overview charts: percentiles, server/model info,
+/// and either the live request log (when one is configured) or the events
+/// vllmtop has observed.
+fn draw_lower(frame: &mut Frame, app: &App, index: usize, e: &EndpointState, area: Rect) {
+    let cols = if area.width >= 150 {
+        3
+    } else if area.width >= 110 {
+        2
+    } else {
+        1
+    };
+    let cells = Layout::horizontal(vec![Constraint::Fill(1); cols]).split(area);
+    panels::draw_percentiles(frame, app, e, cells[0]);
+    if cols >= 2 {
+        panels::draw_info(frame, app, e, cells[1]);
+    }
+    if cols >= 3 {
+        let has_log = app
+            .config
+            .endpoints
+            .get(index)
+            .is_some_and(|c| c.log_file.is_some());
+        if has_log {
+            draw_requests(frame, app, index, e, cells[2]);
+        } else {
+            panels::draw_events(frame, app, e, cells[2]);
+        }
+    }
+}
+
+/// The six overview charts, in priority (= drop) order. Errors, preemptions
+/// and e2e latency stay in the fleet grid and the tables view: an interval
+/// delta and a per-second rate must not share a y-axis.
+fn chart_specs(e: &EndpointState) -> Vec<charts::ChartSpec<'static>> {
+    use crate::state::series_id as sid;
+    let agg = e.aggregate();
+    vec![
+        charts::ChartSpec {
+            title: "tokens/s",
+            headline: None,
+            series: &[
+                charts::SeriesSpec {
+                    id: sid::PROMPT_TPS,
+                    label: "in",
+                },
+                charts::SeriesSpec {
+                    id: sid::GENERATION_TPS,
+                    label: "out",
+                },
+            ],
+            kind: charts::ValueKind::Count,
+        },
+        charts::ChartSpec {
+            title: "requests",
+            headline: None,
+            series: &[
+                charts::SeriesSpec {
+                    id: sid::RUNNING,
+                    label: "run",
+                },
+                charts::SeriesSpec {
+                    id: sid::WAITING,
+                    label: "wait",
+                },
+            ],
+            kind: charts::ValueKind::Count,
+        },
+        charts::ChartSpec {
+            title: "KV cache",
+            headline: Some(format::percent(agg.kv_usage.map(|k| k.value()))),
+            series: &[charts::SeriesSpec {
+                id: sid::KV_USAGE,
+                label: "",
+            }],
+            kind: charts::ValueKind::Fraction,
+        },
+        charts::ChartSpec {
+            title: "TTFT",
+            headline: None,
+            series: &[
+                charts::SeriesSpec {
+                    id: sid::TTFT_P95,
+                    label: "p95",
+                },
+                charts::SeriesSpec {
+                    id: sid::TTFT_P50,
+                    label: "p50",
+                },
+            ],
+            kind: charts::ValueKind::Seconds,
+        },
+        charts::ChartSpec {
+            title: "inter-token",
+            headline: None,
+            series: &[charts::SeriesSpec {
+                id: sid::ITL_P95,
+                label: "p95",
+            }],
+            kind: charts::ValueKind::Seconds,
+        },
+        charts::ChartSpec {
+            title: "completions/s",
+            headline: Some(format::count(agg.request_rate)),
+            series: &[charts::SeriesSpec {
+                id: sid::REQUEST_RATE,
+                label: "",
+            }],
+            kind: charts::ValueKind::Count,
+        },
+    ]
+}
+
+/// Absolute KV usage as `(used_tokens, capacity_tokens)`, only when EVERY
+/// series reports a capacity — otherwise the total would be a partial sum
+/// presented as a whole.
+fn kv_absolute(e: &EndpointState) -> Option<(f64, f64)> {
+    let curated = e.curated.as_ref()?;
+    let caps: Vec<(f64, f64)> = curated
+        .series
+        .values()
+        .filter_map(|s| Some((s.kv_cache_usage?, s.kv_cache_size_tokens?)))
+        .collect();
+    if caps.is_empty() || caps.len() != curated.series.len() {
+        return None;
+    }
+    let total: f64 = caps.iter().map(|(_, c)| c).sum();
+    let used: f64 = caps.iter().map(|(u, c)| u * c).sum();
+    Some((used, total))
+}
+
+/// Sum a lifetime counter across this endpoint's series.
+fn life_sum(e: &EndpointState, get: fn(&CuratedSeries) -> Option<f64>) -> Option<f64> {
+    e.curated.as_ref().and_then(|c| {
+        c.series
+            .values()
+            .filter_map(get)
+            .fold(None, |acc: Option<f64>, v| Some(acc.unwrap_or(0.0) + v))
+    })
+}
+
+/// Recent ring values for a sparkline — ONLY for single-series endpoints.
+/// On a multi-model endpoint, one series' shape is not the endpoint's.
+fn spark_values(e: &EndpointState, id: &'static str, n: usize) -> Vec<f64> {
+    if e.curated.as_ref().map(|c| c.series.len()) != Some(1) {
+        return Vec::new();
+    }
+    e.history
+        .iter()
+        .find(|((_, sid), _)| *sid == id)
+        .map(|(_, ring)| ring.tail_values(n))
+        .unwrap_or_default()
+}
+
+/// Server uptime from `process_start_time_seconds`, guarding against clock
+/// skew between this host and the server (a negative age becomes unknown).
+pub(super) fn uptime(e: &EndpointState) -> Option<std::time::Duration> {
+    let start = e.curated.as_ref()?.info.process_start_unix?;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?
+        .as_secs_f64();
+    let secs = now - start;
+    (secs >= 0.0).then(|| std::time::Duration::from_secs_f64(secs))
+}
+
+/// The six cards, in priority (= drop) order.
+fn endpoint_cards(app: &App, index: usize, e: &EndpointState) -> Vec<cards::Card> {
+    let t = &app.theme;
+    let agg = e.aggregate();
+
+    // 1. Is it working, and how long has it been up? With no running-request
+    //    gauge at all we know nothing, and "IDLE" would be a claim — the card
+    //    stays `--`. (This is what a non-vLLM backend looks like: SGLang, for
+    //    instance, serves /metrics but names everything `sglang:*`.)
+    let generating = agg.running.is_some_and(|r| r > 0.0);
+    let status_value = agg.running.map(|_| {
+        if generating {
+            format!("{} GENERATING", spinner(t))
+        } else {
+            "IDLE".to_string()
+        }
+    });
+    let status = cards::Card::text(t, "STATUS", status_value)
+        .style(if generating { t.value } else { t.dim })
+        .sub(
+            uptime(e).map(|d| format!("up {}", format::uptime(d))),
             t.dim,
-        ));
-    }
-    line1.push(Span::styled("   prompt ", t.dim));
-    line1.push(Span::styled(
-        format!("{} tokens/s", format::count(agg.prompt_tps)),
-        t.value,
-    ));
-    if let Some(pk) = e.peak_prompt_tps {
-        line1.push(Span::styled(
-            format!(" (pk {})", format::count(Some(pk))),
-            t.dim,
-        ));
-    }
-    // Second line: scheduler occupancy plus the lifetime served count —
-    // line 1 already fills a 120-column terminal, so these get their own row.
-    let mut line1b: Vec<Span> = vec![Span::styled("   running ", t.dim)];
+        );
+
+    // 2. Which model, and how big is its context window?
+    let model_name = e
+        .served_models
+        .first()
+        .map(|m| m.id.clone())
+        .or_else(|| agg.models.first().cloned())
+        .map(|m| short_model(&m));
+    let ctx = e.served_models.iter().find_map(|m| m.max_model_len);
+    let model = cards::Card::text(t, "MODEL", model_name).sub(
+        ctx.map(|c| format!("ctx {}", format::count(Some(c as f64)))),
+        t.dim,
+    );
+
+    // 3. KV cache: percentage plus absolute TOKENS. vLLM does not report
+    //    KV bytes (`kv_cache_memory_bytes` is the literal string "None"),
+    //    so a GB figure here would be invented.
+    let kv_frac = agg.kv_usage.map(|k| k.value());
+    let kv_sub = match kv_absolute(e) {
+        Some((used, cap)) => Some(format!(
+            "{} / {} tok",
+            format::count(Some(used)),
+            format::count(Some(cap))
+        )),
+        None if agg.kv_usage.is_some_and(|k| !k.is_weighted()) => Some("unweighted".to_string()),
+        None => None,
+    };
+    let kv = cards::Card::percent(t, "KV CACHE", kv_frac, 0.75, 0.9).sub(kv_sub, t.dim);
+
+    // 4. Scheduler occupancy. `max_running` mirrors --max-num-seqs, which
+    //    vLLM does not export, so the bar only appears when configured.
     let max_running = app
         .config
         .endpoints
         .get(index)
         .and_then(|c| c.max_running)
         .filter(|m| *m > 0);
-    match (agg.running, max_running) {
+    let waiting = agg.waiting.unwrap_or(0.0);
+    let requests = match (agg.running, max_running) {
         (Some(run), Some(max)) => {
             let frac = run / f64::from(max);
-            line1b.push(Span::styled(
-                format!(
-                    "{}/{} {}",
-                    format::count(Some(run)),
-                    max,
-                    format::bar(frac, 8, ascii)
-                ),
-                t.by_level(frac, 0.75, 0.95),
-            ));
+            cards::Card::text(
+                t,
+                "RUNNING",
+                Some(format!("{}/{}", format::count(Some(run)), max)),
+            )
+            .style(t.by_level(frac, 0.75, 0.95))
+            .bar(Some(frac), 0.75, 0.95)
         }
-        (run, _) => line1b.push(Span::styled(format::count(run), t.value)),
+        (run, _) => cards::Card::count(t, "RUNNING", run, None),
     }
-    line1b.push(Span::styled("   waiting ", t.dim));
-    let wait_style = if agg.waiting.unwrap_or(0.0) > 0.0 {
-        t.warn
+    .sub(
+        agg.waiting
+            .map(|w| format!("{} waiting", format::count(Some(w)))),
+        if waiting > 0.0 { t.warn } else { t.dim },
+    );
+
+    // 5. Throughput, with the prompt side as context.
+    let tokens = cards::Card::count(t, "GENERATION", agg.generation_tps, Some("tok/s"))
+        .sub(
+            agg.prompt_tps
+                .map(|p| format!("in {}", format::count(Some(p)))),
+            t.dim,
+        )
+        .spark(spark_values(e, crate::state::series_id::GENERATION_TPS, 16));
+
+    // 6. Latency: worst p95 across series, with the median beside it.
+    let ttft_p50 = e
+        .derived
+        .values()
+        .filter_map(|d| d.estimates.get(hist::TTFT))
+        .filter_map(|est| est.p50)
+        .fold(None, |acc: Option<f64>, v| {
+            Some(acc.map_or(v, |cur: f64| cur.max(v)))
+        });
+    let latency = cards::Card::seconds(t, "TTFT p95", agg.worst_ttft_p95).sub(
+        ttft_p50.map(|p| format!("p50 {}", format::seconds(Some(p)))),
+        t.dim,
+    );
+
+    vec![status, model, kv, requests, tokens, latency]
+}
+
+/// Animated spinner glyph. The UI redraws at least every 500 ms, so this runs
+/// at ~2 fps — enough to read as "alive". (Display-only wall-clock use.)
+fn spinner(t: &crate::ui::theme::Theme) -> &'static str {
+    let frames: &[&str] = if t.ascii() {
+        &["|", "/", "-", "\\"]
     } else {
-        t.value
+        &[
+            "\u{280b}", "\u{2819}", "\u{2839}", "\u{2838}", "\u{283c}", "\u{2834}", "\u{2826}",
+            "\u{2827}", "\u{2807}", "\u{280f}",
+        ]
     };
-    line1b.push(Span::styled(format::count(agg.waiting), wait_style));
+    let ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis();
+    frames[(ms / 250) as usize % frames.len()]
+}
 
-    // Lifetime completions since the server started (counter: resets with a
-    // server restart, which is the honest reading of "served").
-    let served = e.curated.as_ref().and_then(|c| {
-        c.series
-            .values()
-            .filter_map(|s| s.success_total())
-            .fold(None, |acc: Option<f64>, v| Some(acc.unwrap_or(0.0) + v))
-    });
+/// Model names are long; the full name stays in the head line.
+fn short_model(name: &str) -> String {
+    name.rsplit('/').next().unwrap_or(name).to_string()
+}
+
+/// One dim line of lifetime totals: what this server has done since it
+/// started. These are counters, so they reset when it restarts.
+fn draw_lifetime(frame: &mut Frame, app: &App, e: &EndpointState, area: Rect) {
+    let t = &app.theme;
+    let mut spans: Vec<Span> = Vec::new();
+    let served = life_sum(e, |s| s.success_total());
     if served.is_some() {
-        line1b.push(Span::styled("   served ", t.dim));
-        line1b.push(Span::styled(format::count(served), t.value));
+        spans.push(Span::styled(" served ", t.dim));
+        spans.push(Span::styled(format::count(served), t.secondary));
     }
-
-    // Lifetime token odometer (same restart-reset semantics as `served`):
-    // "in" = prompt tokens consumed, "out" = tokens generated.
-    let life_sum = |get: fn(&CuratedSeries) -> Option<f64>| {
-        e.curated.as_ref().and_then(|c| {
-            c.series
-                .values()
-                .filter_map(get)
-                .fold(None, |acc: Option<f64>, v| Some(acc.unwrap_or(0.0) + v))
-        })
-    };
-    let prompt_life = life_sum(|s| s.prompt_tokens);
-    let gen_life = life_sum(|s| s.generation_tokens);
+    let prompt_life = life_sum(e, |s| s.prompt_tokens);
+    let gen_life = life_sum(e, |s| s.generation_tokens);
     if prompt_life.is_some() || gen_life.is_some() {
-        line1b.push(Span::styled("   tokens ", t.dim));
-        line1b.push(Span::styled(
+        spans.push(Span::styled("   tokens ", t.dim));
+        spans.push(Span::styled(
             format!(
                 "{} in / {} out",
                 format::count(prompt_life),
                 format::count(gen_life)
             ),
-            t.value,
+            t.secondary,
         ));
     }
-
-    // Full-width KV bar with absolute tokens when the server exposes its
-    // capacity. This is the aggregate cache: with one conversation running
-    // it is effectively that conversation's KV growing token by token.
-    let mut line2: Vec<Span> = vec![Span::styled(" KV ", t.dim)];
-    match agg.kv_usage {
-        Some(kv) => {
-            let frac = kv.value();
-            // Reserve room for the trailing figures; the bar takes the rest.
-            let bar_width = (area.width as usize).saturating_sub(42).clamp(10, 80);
-            line2.push(Span::styled(
-                format::bar(frac, bar_width, ascii),
-                t.by_level(frac, 0.75, 0.9),
+    // HTTP totals come from the instrumentator, so they cover every route.
+    if let Some(info) = e.curated.as_ref().map(|c| &c.info)
+        && let Some(total) = info.http_total()
+    {
+        spans.push(Span::styled("   http ", t.dim));
+        spans.push(Span::styled(format::count(Some(total)), t.secondary));
+        let errors: f64 = info
+            .http_by_status
+            .iter()
+            .filter(|(k, _)| k.starts_with('5'))
+            .map(|(_, v)| v)
+            .sum();
+        if errors > 0.0 {
+            spans.push(Span::styled(
+                format!(" ({} 5xx)", format::count(Some(errors))),
+                t.crit,
             ));
-            line2.push(Span::styled(
-                format!(" {}", format::percent(Some(frac))),
-                t.by_level(frac, 0.75, 0.9),
-            ));
-            if !kv.is_weighted() {
-                line2.push(Span::styled(" (unweighted)", t.warn));
-            }
-            // Absolute used/capacity, when every series reports capacity.
-            if let Some(curated) = &e.curated {
-                let caps: Vec<(f64, f64)> = curated
-                    .series
-                    .values()
-                    .filter_map(|s| Some((s.kv_cache_usage?, s.kv_cache_size_tokens?)))
-                    .collect();
-                if !caps.is_empty() && caps.len() == curated.series.len() {
-                    let total: f64 = caps.iter().map(|(_, c)| c).sum();
-                    let used: f64 = caps.iter().map(|(u, c)| u * c).sum();
-                    line2.push(Span::styled(
-                        format!(
-                            "  {} / {} tok",
-                            format::count(Some(used)),
-                            format::count(Some(total))
-                        ),
-                        t.secondary,
-                    ));
-                }
-            }
         }
-        None => line2.push(Span::styled(format::NA, t.na)),
     }
-
-    frame.render_widget(
-        Paragraph::new(vec![
-            Line::from(line1),
-            Line::from(line1b),
-            Line::from(line2),
-        ])
-        .block(Block::new().borders(Borders::BOTTOM).border_style(t.dim)),
-        area,
-    );
+    if !spans.is_empty() {
+        frame.render_widget(Paragraph::new(Line::from(spans)), area);
+    }
 }
 
 fn draw_head(frame: &mut Frame, app: &App, e: &EndpointState, area: Rect) {
@@ -240,6 +470,11 @@ fn draw_head(frame: &mut Frame, app: &App, e: &EndpointState, area: Rect) {
     {
         line1.push(Span::styled("  RESTARTED", t.crit));
     }
+    // Which panel mode is showing; 't' cycles it.
+    line1.push(Span::styled(
+        format!("   [{}]", app.panel_mode.label()),
+        t.dim,
+    ));
 
     // Second line: only things worth flagging plus the served models.
     let mut line2: Vec<Span> = Vec::new();
@@ -252,7 +487,14 @@ fn draw_head(frame: &mut Frame, app: &App, e: &EndpointState, area: Rect) {
     if !e.served_models.is_empty() {
         line2.push(Span::styled("   models ", t.dim));
         line2.push(Span::styled(
-            format::truncate(&e.served_models.join(", "), 40),
+            format::truncate(
+                &e.served_models
+                    .iter()
+                    .map(|m| m.id.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                40,
+            ),
             t.secondary,
         ));
     }
@@ -579,26 +821,41 @@ fn draw_latency(frame: &mut Frame, app: &App, e: &EndpointState, area: Rect) {
 /// Bottom charts of the tables view ('t'): generation trend + queue depth.
 fn draw_trends(frame: &mut Frame, app: &App, e: &EndpointState, area: Rect) {
     let [left, right] = Layout::horizontal([Constraint::Percentage(50); 2]).areas(area);
-    super::charts::draw_single_chart(
+    charts::draw_single_chart(
         frame,
         app,
         left,
-        "generation tokens/s",
-        None,
-        &[crate::state::series_id::GENERATION_TPS],
-        Some(e),
+        e,
+        &charts::ChartSpec {
+            title: "generation tokens/s",
+            headline: None,
+            series: &[charts::SeriesSpec {
+                id: crate::state::series_id::GENERATION_TPS,
+                label: "out",
+            }],
+            kind: charts::ValueKind::Count,
+        },
     );
-    super::charts::draw_single_chart(
+    charts::draw_single_chart(
         frame,
         app,
         right,
-        "running / waiting",
-        None,
-        &[
-            crate::state::series_id::RUNNING,
-            crate::state::series_id::WAITING,
-        ],
-        Some(e),
+        e,
+        &charts::ChartSpec {
+            title: "running / waiting",
+            headline: None,
+            series: &[
+                charts::SeriesSpec {
+                    id: crate::state::series_id::RUNNING,
+                    label: "run",
+                },
+                charts::SeriesSpec {
+                    id: crate::state::series_id::WAITING,
+                    label: "wait",
+                },
+            ],
+            kind: charts::ValueKind::Count,
+        },
     );
 }
 
@@ -610,37 +867,58 @@ fn draw_rate_charts(frame: &mut Frame, app: &App, e: &EndpointState, area: Rect)
     let rate = |v: Option<f64>| v.map(|v| format!("{} tokens/s", format::count(Some(v))));
     if area.height >= 12 {
         let [top, bottom] = Layout::vertical([Constraint::Percentage(50); 2]).areas(area);
-        super::charts::draw_single_chart(
+        charts::draw_single_chart(
             frame,
             app,
             top,
-            "prefill tokens",
-            rate(agg.prompt_tps),
-            &[crate::state::series_id::PROMPT_TPS],
-            Some(e),
+            e,
+            &charts::ChartSpec {
+                title: "prefill tokens",
+                headline: rate(agg.prompt_tps),
+                series: &[charts::SeriesSpec {
+                    id: crate::state::series_id::PROMPT_TPS,
+                    label: "",
+                }],
+                kind: charts::ValueKind::Count,
+            },
         );
-        super::charts::draw_single_chart(
+        charts::draw_single_chart(
             frame,
             app,
             bottom,
-            "generation tokens",
-            rate(agg.generation_tps),
-            &[crate::state::series_id::GENERATION_TPS],
-            Some(e),
+            e,
+            &charts::ChartSpec {
+                title: "generation tokens",
+                headline: rate(agg.generation_tps),
+                series: &[charts::SeriesSpec {
+                    id: crate::state::series_id::GENERATION_TPS,
+                    label: "",
+                }],
+                kind: charts::ValueKind::Count,
+            },
         );
     } else {
         // Too short for two readable charts: one combined chart.
-        super::charts::draw_single_chart(
+        charts::draw_single_chart(
             frame,
             app,
             area,
-            "prefill + generation tokens",
-            rate(agg.generation_tps),
-            &[
-                crate::state::series_id::PROMPT_TPS,
-                crate::state::series_id::GENERATION_TPS,
-            ],
-            Some(e),
+            e,
+            &charts::ChartSpec {
+                title: "tokens/s",
+                headline: None,
+                series: &[
+                    charts::SeriesSpec {
+                        id: crate::state::series_id::PROMPT_TPS,
+                        label: "in",
+                    },
+                    charts::SeriesSpec {
+                        id: crate::state::series_id::GENERATION_TPS,
+                        label: "out",
+                    },
+                ],
+                kind: charts::ValueKind::Count,
+            },
         );
     }
 }
@@ -705,7 +983,7 @@ fn draw_requests(frame: &mut Frame, app: &App, index: usize, e: &EndpointState, 
     }
 
     let header = Row::new(
-        ["age", "prompt", "req id", "max_tok"]
+        ["age", "status", "prompt", "req id", "max_tok"]
             .into_iter()
             .map(|h| Cell::from(Span::styled(h, t.heading))),
     );
@@ -716,18 +994,28 @@ fn draw_requests(frame: &mut Frame, app: &App, index: usize, e: &EndpointState, 
         .iter_newest_first()
         .take(visible.max(1))
         .map(|entry| {
-            let finished = matches!(
-                entry.status,
-                crate::state::requests::RequestStatus::Finished { .. }
-            );
+            use crate::state::requests::RequestStatus;
+            let finished = matches!(entry.status, RequestStatus::Finished { .. });
             let row_style = if finished { t.dim } else { t.text };
             let age = format::brief_duration(now.saturating_duration_since(entry.seen_at));
+            // The finish reason is the one thing the log tells us about how a
+            // request ended; `length` and `abort` read very differently from
+            // `stop`.
+            let (status_text, status_style) = match &entry.status {
+                RequestStatus::Generating => ("● running".to_string(), t.value),
+                RequestStatus::Finished { reason } => match reason.as_deref() {
+                    Some("stop") => ("○ stop".to_string(), t.dim),
+                    Some(other) => (format!("○ {other}"), t.warn),
+                    None => ("○ done".to_string(), t.dim),
+                },
+            };
             let prompt = match &entry.prompt_preview {
                 Some(p) => Span::styled(p.clone(), row_style),
                 None => Span::styled(format::NA, t.na),
             };
             Row::new(vec![
                 Cell::from(Span::styled(age, t.dim)),
+                Cell::from(Span::styled(status_text, status_style)),
                 Cell::from(prompt),
                 Cell::from(Span::styled(format::truncate(&entry.id, 14), t.secondary)),
                 Cell::from(Span::styled(
@@ -743,6 +1031,7 @@ fn draw_requests(frame: &mut Frame, app: &App, index: usize, e: &EndpointState, 
 
     let widths = [
         Constraint::Length(5),
+        Constraint::Length(9),
         Constraint::Min(10),
         Constraint::Length(14),
         Constraint::Length(7),

@@ -64,6 +64,22 @@ rest of vllmtop is built on. For the exact curated-metric table see
   `vllm:prefix_cache_queries_total` / `hits_total` (lifetime counters; a
   windowed hit rate needs deltas of both).
 
+## The server process itself
+
+`prometheus_client`'s default collector adds unlabeled `process_*` series:
+`process_start_time_seconds` (the only source of **uptime**),
+`process_resident_memory_bytes`, `process_cpu_seconds_total`,
+`process_open_fds`/`process_max_fds`.
+
+Two caveats decide how they may be presented:
+
+1. They describe the **API-server front-end**. In vLLM V1 the engine runs in
+   a separate process, so the RSS figure is not model weights or KV cache.
+2. They **disappear entirely** when the server runs with
+   `--api-server-count > 1`: multiprocess mode swaps in a
+   `MultiProcessCollector` that drops the default process/platform/GC
+   collectors. Treat every field as optional.
+
 ## Requests
 
 - The **only finished-request counter** is `vllm:request_success_total`,
@@ -83,6 +99,20 @@ rest of vllmtop is built on. For the exact curated-metric table see
   including work for requests that later aborted. They are "work the model
   did", not "tokens delivered to clients" — delivered-only accounting is
   not derivable from vLLM's metrics.
+
+## Model metadata
+
+`/v1/models` is mounted unconditionally and carries more than the served
+name: `root` is the underlying HF repo id or local path, and
+`max_model_len` is the context window — which is **not** available from
+`/metrics` at all. LoRA adapter cards omit `max_model_len`, so read it from
+the card whose `parent` is unset.
+
+`/server_info` would supply tensor-parallel size, scheduler config and GPU
+model names, but it exists only when the operator sets
+`VLLM_SERVER_DEV_MODE=1`, which also mounts vLLM's *mutating* dev endpoints
+(sleep/rpc) and logs a security warning. vllmtop deliberately does not probe
+it, and nobody should be told to enable it for a dashboard.
 
 ## Per-request and per-user visibility
 

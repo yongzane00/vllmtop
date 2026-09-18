@@ -60,10 +60,10 @@ that keep them from coming back. Ordered by layer, not chronology.
 ## UI
 
 - **ratatui `Paragraph` clips silently.** Appending the `served` counter to
-  a pulse-strip line that already measured ~115 cells at 120 columns made
+  a status line that already measured ~115 cells at 120 columns made
   the new field invisible — no error, no wrap, just gone. Measure a line's
   worst case before appending to it; if it doesn't fit, restructure (the
-  pulse strip became three lines).
+  line was split in three; that strip later became the card band).
 - **Absent ≠ zero must survive into charts — and widgets can defeat it.**
   ratatui's `BarChart` renders nothing for zero-height bars (absent-day
   `--` markers silently vanished) and its per-bar labels fuse into an
@@ -72,9 +72,47 @@ that keep them from coming back. Ordered by layer, not chronology.
   baseline dot for unobserved days, and sparse relative date ticks
   (`-5d … today`). Verify chart honesty against a *sparse* dataset (day
   one of recording), not just a dense demo.
+- **A widget's own legend can cover the data.** ratatui's `Chart` legend is
+  a bordered box drawn *inside* the plot area; at a 7-row chart it hides most
+  of the line it labels. Rendering the legend into the block's title costs
+  zero plot rows and doubles as a per-series live value.
+- **Merging series keys into one line draws a sawtooth.** The endpoint charts
+  collected every `(model, engine)` ring for a metric into a single sorted
+  point list, interleaving two models' samples into a zigzag that looked like
+  data. One dataset per (metric, series key), ordered deterministically so
+  colours do not shuffle between frames.
+- **Colour is not a channel in monochrome.** Overlaid lines were distinguished
+  only by `series_color`, which returns the default style in mono — so two
+  lines became one. Vary the *marker* per line as well.
+- **`--` must survive the widget too.** A card whose value is unknown gets no
+  unit, no bar and no sparkline: a bar drawn for an unknown fraction reads as
+  a measurement. Enforced in one place (the card constructors) rather than at
+  every call site.
 - **Dynamic sizing beats clever clipping**: bar width derives from the
   area every frame; when 30 days can't fit, show the last N and label it
   `(last Nd)` in the title rather than cropping silently.
+
+## Testing the UI
+
+- **Nothing rendered a frame until late.** All ~2,200 lines of `ui/` were
+  unreachable from the test suite, so a layout panic or constraint overflow
+  could only be found by running the binary. `TestBackend` ships inside the
+  already-compiled `ratatui-core`, so the whole render matrix (sizes × views
+  × panel modes × themes) cost no new dependency.
+- **Test the boundaries, not the round numbers.** Off-by-ones live at the
+  exact width/height where a ladder switches rungs (36/100/150 columns, the
+  minimum chart and band heights), so the sweep clusters sizes around each
+  threshold instead of stepping uniformly.
+- **A latent panic only a render test finds.** `((fit - 1) * step + bar_w)`
+  in the usage chart underflows when no days are recorded — unreachable in
+  production because the query always returns 30 days, but one empty-list
+  path away from taking down the whole TUI.
+- **Wall-clock assertions are the classic flaky test.** The phase-stagger
+  integration test asserted start instants within ±200 ms of a 250 ms
+  spacing; under full-suite load tokio wake-ups drift further and it failed
+  intermittently. It now asserts the *shape* — ordering plus a generous
+  envelope — while the exact arithmetic stays covered by a deterministic
+  unit test.
 
 ## Rendering to SVG (screenshot pipeline)
 
@@ -100,6 +138,14 @@ that keep them from coming back. Ordered by layer, not chronology.
 
 ## Process
 
+- **Live validation catches what mocks cannot.** A run against the dev box
+  showed every metric as `--`: the server had been replaced by **SGLang**,
+  which serves `/metrics` and `/v1/models` but names every metric
+  `sglang:*`. The degradation was correct (no crash, no fake zeros, model
+  and context window still read from `/v1/models`) — except the STATUS card,
+  which said `IDLE` when it had never seen a running-request gauge at all.
+  Unknown is not idle; that card now stays `--`. Mock servers only ever
+  speak the dialect you taught them.
 - **Verify before claiming.** The dev endpoint is sometimes unreachable;
   a run that never scraped proves nothing about live behavior (it does
   prove failure modes — report it as that). `curl` first.

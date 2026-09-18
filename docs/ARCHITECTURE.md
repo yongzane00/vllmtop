@@ -44,11 +44,36 @@ Design rules:
 | `metrics/normalize.rs` | Curated extraction + capability detection + alias table, keyed by `(model_name, engine)`. The only file that knows `vllm:*` name strings. |
 | `metrics/rates.rs` | Reset-aware counter deltas over a monotonic clock; `CounterBank` with generation eviction. |
 | `metrics/histogram.rs` | Ring of cumulative snapshots → windowed bucket deltas → p50/p95/p99 interpolation. |
-| `state/` | `EndpointState::apply(outcome)` reducer, freshness/staleness, endpoint aggregates (incl. KV capacity weighting), ring-buffer history, bounded per-request ring (`state/requests.rs`). |
+| `state/` | `EndpointState::apply(outcome)` reducer, freshness/staleness, endpoint aggregates (incl. KV capacity weighting), fleet roll-up (`aggregate_fleet`), ring-buffer history, bounded per-request ring (`state/requests.rs`), bounded observation feed (`state/events.rs`). |
 | `logtail/` | Opt-in per-endpoint tailer of the vLLM server's stdout log (`log_file`): poll-based (500 ms), starts at EOF, rotation/truncation-aware, bounded (256 KiB/tick, 16 KiB/line, 256 events/batch), std-only line parser with ANSI stripping. Sends `AppEvent::RequestLog`. |
-| `ui/` | Theme (truecolor/256/mono), formatting, the fleet view (endpoint table + daily-usage bar charts + history-chart grid), and the endpoint detail view (rate charts + requests pane by default; `t` toggles the tables). Pure functions of `&App`. |
+| `ui/` | Theme (truecolor/256/mono), formatting, the fleet view (card band + endpoint table + daily-usage bars + history-chart grid), and the endpoint detail view (card band + panel modes). Pure functions of `&App`. |
+| `ui/cards.rs` | The stat-card widget both views share. Takes `&Theme`, not `&App`, so it is testable without an application. Its constructors are the single place `None` becomes `--`: an unavailable value gets no unit, no bar and no sparkline. |
+| `ui/panels.rs` | The overview's detail band: latency percentiles (worst across series), server/model facts, and the observed-events feed. |
 | `storage/` | SQLite recorder thread: WAL, batched transactions, chunked retention cleanup, verified write counters, schema versioning. On by default (`$XDG_DATA_HOME/vllmtop/usage.db`); `--no-record` opts out. |
 | `storage/usage.rs` | Read side: per-local-day usage totals (tokens in/out, requests) from 30 s cumulative-counter snapshots, computed in SQL as segment-wise positive `LAG` deltas (restart-safe) on a second read-only WAL connection via `spawn_blocking`; result cached in `App::usage`. |
+
+### Endpoint-global metrics, and what they do NOT mean
+
+`series_key()` requires a `model_name` label, so unlabeled samples were
+dropped by curation. `CuratedScrape::info` (`EndpointInfo`) now carries them,
+with three labels the UI must never blur:
+
+- `process_resident_memory_bytes` is the **HTTP front-end** process. In
+  vLLM V1 the model runs in a separate engine process, so this is not model
+  or KV memory; the info panel says `api proc mem` for exactly that reason.
+  All `process_*` metrics vanish under `--api-server-count > 1` (multiprocess
+  mode drops prometheus_client's default collector), so every field is
+  `Option` and the card degrades to `--`.
+- `cache_config_info.gpu_memory_utilization` is the fraction the operator
+  **asked for**, not a measurement — rendered as `(configured)`.
+- `cache_config_info.kv_cache_memory_bytes` is the literal string `"None"`,
+  so KV is reported in **tokens**. Capacity comes from `kv_cache_size_tokens`
+  directly and is never derived as `num_gpu_blocks × block_size`: on a hybrid
+  Mamba model those disagree (442 × 784 = 346,528 vs a true 342,803).
+
+Only a fixed whitelist of `cache_config_info` labels is kept, each truncated:
+the label set is server-controlled, so copying it wholesale would be an
+unbounded allocation driven by the monitored process.
 
 ### Log tailing and the privacy firewall
 

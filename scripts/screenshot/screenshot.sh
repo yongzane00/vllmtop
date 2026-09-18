@@ -12,8 +12,8 @@ export PATH="$HOME/.cargo/bin:$PATH" # non-login shells (wsl -e) miss it
 export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-$HOME/build/vllmtop-target}"
 WORK="$HOME/vllmtop-shots"
 SESSION=vtshot
-COLS=120
-ROWS=32
+COLS=${COLS:-160}
+ROWS=${ROWS:-44}
 WARMUP="${WARMUP:-45}" # seconds of history before capturing
 
 mkdir -p "$WORK"
@@ -100,15 +100,21 @@ tmux send-keys -t "$SESSION" 1
 sleep 2
 tmux capture-pane -t "$SESSION" -e -p >"$WORK/fleet.ans"
 
-echo "== capture endpoint view (charts + requests) =="
+echo "== capture endpoint view (overview mode) =="
 tmux send-keys -t "$SESSION" 2
 sleep 2
 tmux capture-pane -t "$SESSION" -e -p >"$WORK/endpoint.ans"
+
+echo "== capture endpoint view (requests mode) =="
+tmux send-keys -t "$SESSION" t
+sleep 2
+tmux capture-pane -t "$SESSION" -e -p >"$WORK/endpoint-requests.ans"
 
 tmux send-keys -t "$SESSION" q
 sleep 1
 
 echo "== render SVGs =="
-python3 "$HERE/ans2svg.py" "$WORK/fleet.ans" "$REPO/docs/img/fleet.svg"
-python3 "$HERE/ans2svg.py" "$WORK/endpoint.ans" "$REPO/docs/img/endpoint.svg"
-echo "wrote docs/img/fleet.svg and docs/img/endpoint.svg"
+python3 "$HERE/ans2svg.py" "$WORK/fleet.ans" "$REPO/docs/img/fleet.svg" "$COLS"
+python3 "$HERE/ans2svg.py" "$WORK/endpoint.ans" "$REPO/docs/img/endpoint.svg" "$COLS"
+python3 "$HERE/ans2svg.py" "$WORK/endpoint-requests.ans" "$REPO/docs/img/endpoint-requests.svg" "$COLS"
+echo "wrote docs/img/{fleet,endpoint,endpoint-requests}.svg"

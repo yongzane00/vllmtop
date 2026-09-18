@@ -16,6 +16,8 @@ import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 START = time.monotonic()
+# Wall-clock start, for process_start_time_seconds (uptime).
+START_WALL = time.time() - 24_460  # pretend the server has been up ~6.8 h
 
 
 def build_metrics(cfg):
@@ -52,8 +54,39 @@ def build_metrics(cfg):
     gauge("vllm:num_requests_waiting", waiting)
     gauge("vllm:kv_cache_usage_perc", round(kv, 4))
     out.append("# TYPE vllm:cache_config_info gauge")
+    # kv_cache_memory_bytes is the literal string "None" on real servers.
     out.append(
-        f'vllm:cache_config_info{{engine="0",num_gpu_blocks="{cfg["blocks"]}",block_size="16"}} 1'
+        'vllm:cache_config_info{'
+        f'engine="0",num_gpu_blocks="{cfg["blocks"]}",block_size="16",'
+        f'kv_cache_size_tokens="{cfg["blocks"] * 16}",cache_dtype="auto",'
+        'gpu_memory_utilization="0.90",kv_cache_memory_bytes="None",'
+        'enable_prefix_caching="True"} 1'
+    )
+
+    # Endpoint-global metrics: unlabeled process series from the default
+    # prometheus_client collector, plus the FastAPI instrumentator's counts.
+    out.append("# TYPE process_start_time_seconds gauge")
+    out.append(f"process_start_time_seconds {START_WALL:.2f}")
+    out.append("# TYPE process_resident_memory_bytes gauge")
+    out.append(f"process_resident_memory_bytes {cfg['rss_bytes']:.1f}")
+    out.append("# TYPE process_cpu_seconds_total counter")
+    out.append(f"process_cpu_seconds_total {t * cfg['cpu_frac']:.2f}")
+    out.append("# TYPE process_open_fds gauge")
+    out.append(f"process_open_fds {cfg['fds']}")
+    out.append("# TYPE process_max_fds gauge")
+    out.append("process_max_fds 65535.0")
+    out.append("# TYPE http_requests_total counter")
+    ok = mono(cfg["req_rate"], 19)
+    out.append(
+        'http_requests_total{handler="/v1/chat/completions",method="POST",'
+        f'status="2xx"}} {int(ok)}.0'
+    )
+    out.append(
+        f'http_requests_total{{handler="/v1/models",method="GET",status="2xx"}} {int(t / 3)}.0'
+    )
+    out.append(
+        'http_requests_total{handler="/v1/chat/completions",method="POST",'
+        f'status="5xx"}} {cfg["http_5xx"]}'
     )
 
     counter("vllm:prompt_tokens_total", round(mono(cfg["prompt_tps"], 17), 1))
@@ -65,7 +98,7 @@ def build_metrics(cfg):
     for reason, share in (("stop", 0.92), ("length", 0.06), ("abort", 0.02)):
         out.append(
             f'vllm:request_success_total{{{lab},finished_reason="{reason}"}} '
-            f"{round(total_reqs * share, 1)}"
+            f"{int(total_reqs * share)}.0"
         )
 
     queries = mono(cfg["prompt_tps"] * 0.9, 17)
@@ -122,7 +155,17 @@ class Handler(BaseHTTPRequestHandler):
             ctype = "application/json"
         elif self.path == "/v1/models":
             body = json.dumps(
-                {"object": "list", "data": [{"id": self.cfg["model"], "object": "model"}]}
+                {
+                    "object": "list",
+                    "data": [
+                        {
+                            "id": self.cfg["model"],
+                            "object": "model",
+                            "root": "/models/" + self.cfg["model"].split("/")[-1],
+                            "max_model_len": self.cfg["max_model_len"],
+                        }
+                    ],
+                }
             ).encode()
             ctype = "application/json"
         else:
@@ -144,6 +187,7 @@ PROFILES = {
         req_rate=0.8, prompt_tps=220.0, gen_tps=48.0,
         run_base=3.2, run_amp=2.6, kv_base=0.42, kv_amp=0.22,
         blocks=4131, hit_rate=0.58, phase=0.0,
+        rss_bytes=2.53e9, cpu_frac=0.31, fds=63, http_5xx=1, max_model_len=262144,
         ttft_w=[5, 20, 35, 22, 10, 5, 2, 0.7, 0.3],
         itl_w=[10, 30, 35, 18, 5, 1.5, 0.5],
         e2e_w=[1, 3, 8, 18, 30, 25, 10, 4, 1],
@@ -153,6 +197,7 @@ PROFILES = {
         req_rate=2.2, prompt_tps=520.0, gen_tps=130.0,
         run_base=1.8, run_amp=1.5, kv_base=0.22, kv_amp=0.13,
         blocks=8265, hit_rate=0.71, phase=2.1,
+        rss_bytes=1.71e9, cpu_frac=0.44, fds=48, http_5xx=0, max_model_len=131072,
         ttft_w=[15, 35, 30, 12, 5, 2, 0.7, 0.2, 0.1],
         itl_w=[25, 40, 25, 8, 1.5, 0.4, 0.1],
         e2e_w=[4, 10, 22, 30, 20, 9, 3, 1.5, 0.5],

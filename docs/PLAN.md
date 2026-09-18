@@ -48,11 +48,13 @@ src/
 ├── logtail/         opt-in per-endpoint tailer of vLLM's stdout log (bounded,
 │                    std-only line parser) feeding the requests pane
 ├── state/           AppState, EndpointState, ring-buffer history,
-│                    bounded per-request ring (requests.rs)
-├── ui/              theme (NO_COLOR aware), fleet view (endpoint table +
-│                    daily-usage bar charts + history-chart grid), endpoint
-│                    detail view (rate charts + requests pane; 't' = tables),
-│                    help overlay, formatting widgets
+│                    bounded per-request ring (requests.rs) and observation
+│                    feed (events.rs), fleet roll-up
+├── ui/              theme (NO_COLOR aware), cards.rs (stat-card widget used
+│                    by both views), charts.rs, panels.rs (percentiles /
+│                    server-model info / events), fleet view (cards + table +
+│                    daily-usage bars + history grid), endpoint detail view
+│                    (cards + panel modes; 't' cycles), help, formatting
 └── storage/         SQLite schema, batched writes, retention; usage.rs =
                      read-only per-local-day aggregation for the fleet charts
 ```
@@ -110,6 +112,17 @@ src/
     DEBUG). Previews are bounded (120 bytes, 200-entry ring), in-memory
     only, and never reach the recorder or any log/file. The endpoint view
     defaults to rate charts + requests pane; `t` restores the tables.
+12. **Dashboard redesign (owner decision, 2026-09)**: the endpoint view
+    became a card band over panel modes (`t` cycles overview / requests /
+    tables), the fleet view gained an additive card tier that can never
+    starve its chart grid, and both read a new endpoint-global
+    `CuratedScrape::info`. Rejected from the supplied mockup, with evidence:
+    a GPU hardware panel (vLLM exports none, and NVML would report the
+    *monitoring* host under a remote endpoint's tab), KV cache in GB
+    (`kv_cache_memory_bytes` is the string `"None"`), per-request
+    tokens/TTFT/e2e (absent from `/metrics` and from the request log), and
+    `/server_info` (needs `VLLM_SERVER_DEV_MODE=1`, which also mounts vLLM's
+    mutating dev endpoints).
 
 ## Milestones
 
@@ -136,6 +149,10 @@ src/
 - [x] M11 Verification: fmt/clippy/test/release-build clean; mock + live
       read-only validation; failure-injection run (live endpoint + dead
       endpoint), NO_COLOR + 60×12 terminal runs, SIGTERM restore verified
+- [x] M12 Dashboard redesign: endpoint-global metric curation, stat cards on
+      both views, panel modes (`t`), six-chart overview with in-title
+      legends, percentiles/info/events panels, and the first frame-rendering
+      test matrix (`TestBackend`, sizes × views × modes × themes)
 
 ## Deliberately open
 

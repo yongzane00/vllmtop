@@ -211,9 +211,10 @@ def render(grid, cols):
 
 
 if __name__ == "__main__":
-    if len(sys.argv) != 3:
-        sys.exit("usage: ans2svg.py capture.ans out.svg [< cols=120 fixed >]")
+    if len(sys.argv) not in (3, 4):
+        sys.exit("usage: ans2svg.py capture.ans out.svg [cols]")
+    cols = int(sys.argv[3]) if len(sys.argv) == 4 else 120
     with open(sys.argv[1], encoding="utf-8", errors="replace") as f:
-        grid = parse(f.read(), 120)
+        grid = parse(f.read(), cols)
     with open(sys.argv[2], "w", encoding="utf-8") as f:
-        f.write(render(grid, 120))
+        f.write(render(grid, cols))

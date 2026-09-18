@@ -152,7 +152,14 @@ async fn full_pipeline_against_mock_server() {
     assert_eq!(state.status, ConnStatus::Connected);
     assert_eq!(state.healthy, Some(true));
     assert_eq!(state.vllm_version.as_deref(), Some("0.24.0"));
-    assert_eq!(state.served_models, vec!["example-org/example-model-27B"]);
+    assert_eq!(
+        state
+            .served_models
+            .iter()
+            .map(|m| m.id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["example-org/example-model-27B"]
+    );
     assert_eq!(
         state.freshness(std::time::Instant::now(), config.refresh_interval),
         Freshness::Fresh
@@ -376,12 +383,28 @@ async fn first_metrics_attempts_use_fixed_quarter_second_fleet_phases() {
     .await
     .expect("fleet did not start all first attempts");
 
+    // The exact arithmetic is covered deterministically by
+    // `collector::tests::fleet_phase_offsets_repeat_in_four_quarter_second_slots`.
+    // End to end, tokio wake-ups drift under parallel test load, so assert
+    // the SHAPE — increasing order and a ~750 ms spread — rather than exact
+    // instants. A 400 ms envelope still fails loudly if the stagger is not
+    // wired up at all (every offset would collapse to ~0).
+    let offsets: Vec<Duration> = (0..4)
+        .map(|i| starts[i].saturating_duration_since(starts[0]))
+        .collect();
+    for idx in 1..4 {
+        assert!(
+            offsets[idx] >= offsets[idx - 1],
+            "endpoint {idx} started before endpoint {}: {offsets:?}",
+            idx - 1
+        );
+    }
     for (idx, expected_ms) in [0_u64, 250, 500, 750].into_iter().enumerate() {
-        let actual = starts[idx].duration_since(starts[0]);
         let expected = Duration::from_millis(expected_ms);
         assert!(
-            actual.abs_diff(expected) <= Duration::from_millis(200),
-            "endpoint {idx}: expected {expected:?}, got {actual:?}"
+            offsets[idx].abs_diff(expected) <= Duration::from_millis(400),
+            "endpoint {idx}: expected ~{expected:?}, got {:?}",
+            offsets[idx]
         );
     }
 }

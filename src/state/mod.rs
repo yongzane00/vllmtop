@@ -1,6 +1,7 @@
 //! Application state: one `AppState` owned by the main loop, updated by
 //! reducing collector events, read by the renderer. No locks, no sharing.
 
+pub mod events;
 pub mod history;
 pub mod requests;
 
@@ -21,6 +22,7 @@ pub mod series_id {
     pub const PROMPT_TPS: &str = "prompt_tps";
     pub const GENERATION_TPS: &str = "generation_tps";
     pub const REQUEST_RATE: &str = "request_rate";
+    pub const TTFT_P50: &str = "ttft_p50";
     pub const TTFT_P95: &str = "ttft_p95";
     pub const ITL_P95: &str = "itl_p95";
     pub const E2E_P95: &str = "e2e_p95";
@@ -35,6 +37,7 @@ pub mod series_id {
         PROMPT_TPS,
         GENERATION_TPS,
         REQUEST_RATE,
+        TTFT_P50,
         TTFT_P95,
         ITL_P95,
         E2E_P95,
@@ -71,7 +74,18 @@ pub struct ScrapePayload {
     pub metrics: Option<ScrapeText>,
     pub healthy: Option<bool>,
     pub version: Option<String>,
-    pub models: Option<Vec<String>>,
+    pub models: Option<Vec<ServedModel>>,
+}
+
+/// One model card from `/v1/models`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ServedModel {
+    /// The served name (`--served-model-name`).
+    pub id: String,
+    /// Underlying HF repo id or local filesystem path, when reported.
+    pub root: Option<String>,
+    /// Context window. LoRA adapter cards leave this unset.
+    pub max_model_len: Option<u64>,
 }
 
 /// Windowed/derived values for one (model, engine) series.
@@ -124,7 +138,7 @@ pub struct EndpointState {
     pub display_url: String,
     pub status: ConnStatus,
     pub vllm_version: Option<String>,
-    pub served_models: Vec<String>,
+    pub served_models: Vec<ServedModel>,
     /// `/health` result: None = never checked / unknown.
     pub healthy: Option<bool>,
     /// Monotonic start time of the most recent `/metrics` attempt.
@@ -153,6 +167,9 @@ pub struct EndpointState {
     /// Recent requests from the (opt-in) log tailer. Prompt previews live
     /// only here — see `state::requests` for the privacy firewall.
     pub requests: requests::RequestLog,
+    /// Things vllmtop observed about this endpoint (connect, fail, restart,
+    /// preemption, errors). Bounded; see `state::events`.
+    pub events: events::EventLog,
 
     counters: CounterBank<(SeriesKey, String)>,
     windows: HashMap<(SeriesKey, &'static str), HistogramWindow>,
@@ -189,6 +206,7 @@ impl EndpointState {
             restart_seen_at: None,
             history: HashMap::new(),
             requests: requests::RequestLog::default(),
+            events: events::EventLog::default(),
             counters: CounterBank::new(),
             windows: HashMap::new(),
             history_window,
@@ -222,11 +240,36 @@ impl EndpointState {
                     ConnStatus::Failing { consecutive, .. } => consecutive + 1,
                     _ => 1,
                 };
+                // Only the first failure of a run is an event; a flapping
+                // endpoint must not flood the feed.
+                if consecutive == 1 {
+                    self.events
+                        .push(outcome.at, events::EventKind::Failed, error.clone());
+                }
                 self.status = ConnStatus::Failing { error, consecutive };
                 // Deliberately keep raw/curated/derived: last good snapshot
                 // stays visible, flagged stale via freshness().
             }
             Ok(payload) => {
+                match &self.status {
+                    ConnStatus::Failing { consecutive, .. } => {
+                        let n = *consecutive;
+                        self.events.push(
+                            outcome.at,
+                            events::EventKind::Recovered,
+                            format!("scraping again after {n} failed attempt(s)"),
+                        );
+                    }
+                    // First ever success.
+                    _ if self.last_ok_at.is_none() => {
+                        self.events.push(
+                            outcome.at,
+                            events::EventKind::Connected,
+                            "first successful scrape".to_string(),
+                        );
+                    }
+                    _ => {}
+                }
                 self.status = ConnStatus::Connected;
                 if let Some(healthy) = payload.healthy {
                     self.healthy = Some(healthy);
@@ -257,7 +300,7 @@ impl EndpointState {
         &mut self,
         healthy: Option<bool>,
         version: Option<String>,
-        models: Option<Vec<String>>,
+        models: Option<Vec<ServedModel>>,
     ) {
         if let Some(healthy) = healthy {
             self.healthy = Some(healthy);
@@ -366,9 +409,41 @@ impl EndpointState {
         self.derived = derived;
         self.curated = Some(curated);
 
+        // Observations worth remembering, all from deltas just computed —
+        // no extra scraping, no extra I/O.
+        let preempted: f64 = self
+            .derived
+            .values()
+            .filter_map(|d| d.preemption_delta)
+            .sum();
+        if preempted > 0.0 {
+            self.events.push(
+                at,
+                events::EventKind::Preemption,
+                format!("{preempted:.0} request(s) preempted"),
+            );
+        }
+        let errored: f64 = self
+            .derived
+            .values()
+            .filter_map(|d| d.error_abort_delta)
+            .sum();
+        if errored > 0.0 {
+            self.events.push(
+                at,
+                events::EventKind::Errors,
+                format!("{errored:.0} request(s) finished as error/abort"),
+            );
+        }
+
         // Track session peaks of the aggregate rates; a server restart
         // invalidates earlier peaks along with everything else cumulative.
         if self.derived.values().any(|d| d.reset_detected) {
+            self.events.push(
+                at,
+                events::EventKind::Restarted,
+                "counters reset — server restarted".to_string(),
+            );
             self.peak_generation_tps = None;
             self.peak_prompt_tps = None;
         }
@@ -406,13 +481,19 @@ impl EndpointState {
             let d = self.derived.get(key);
             let est =
                 |h: &str| -> Option<f64> { d.and_then(|d| d.estimates.get(h)).and_then(|e| e.p95) };
-            let pairs: [(&'static str, Option<f64>); 11] = [
+            let est_p50 =
+                |h: &str| -> Option<f64> { d.and_then(|d| d.estimates.get(h)).and_then(|e| e.p50) };
+            let pairs: [(&'static str, Option<f64>); 12] = [
                 (series_id::RUNNING, series.running),
                 (series_id::WAITING, series.waiting),
                 (series_id::KV_USAGE, series.kv_cache_usage),
                 (series_id::PROMPT_TPS, d.and_then(|d| d.prompt_tps)),
                 (series_id::GENERATION_TPS, d.and_then(|d| d.generation_tps)),
                 (series_id::REQUEST_RATE, d.and_then(|d| d.request_rate)),
+                (
+                    series_id::TTFT_P50,
+                    est_p50(crate::metrics::normalize::hist::TTFT),
+                ),
                 (
                     series_id::TTFT_P95,
                     est(crate::metrics::normalize::hist::TTFT),
@@ -562,6 +643,84 @@ fn sum_opt(acc: &mut Option<f64>, v: Option<f64>) {
     }
 }
 
+/// Fleet-wide roll-up across endpoints, for the fleet view's card band.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct FleetAggregate {
+    pub endpoints_total: usize,
+    /// Fresh and not reporting unhealthy.
+    pub endpoints_up: usize,
+    pub endpoints_stale: usize,
+    /// Never connected, or currently failing.
+    pub endpoints_down: usize,
+    pub running: Option<f64>,
+    pub waiting: Option<f64>,
+    pub prompt_tps: Option<f64>,
+    pub generation_tps: Option<f64>,
+    pub request_rate: Option<f64>,
+    pub error_abort_delta: Option<f64>,
+    pub kv_usage: Option<KvAggregate>,
+    pub worst_ttft_p95: Option<f64>,
+    /// Which endpoint owns `worst_ttft_p95` — a fleet number is only
+    /// actionable if you know where to look.
+    pub worst_ttft_endpoint: Option<String>,
+}
+
+/// Roll up the fleet. Counts sum; KV goes through [`aggregate_kv`] over the
+/// FLATTENED fleet-wide (usage, capacity) pairs, so weighting happens at the
+/// series level and never as a mean of means; latencies take the worst and
+/// name the endpoint.
+///
+/// Freshness is supplied by the caller rather than computed here, which keeps
+/// this clock-free and unit-testable (the same discipline `aggregate_kv`
+/// follows). Only `Fresh` endpoints contribute activity numbers — a stale
+/// snapshot must not inflate fleet totals — but every endpoint is counted in
+/// the status tallies.
+pub fn aggregate_fleet<'a>(
+    endpoints: impl Iterator<Item = (&'a EndpointState, Freshness)>,
+) -> FleetAggregate {
+    let mut agg = FleetAggregate::default();
+    let mut kv_pairs: Vec<(f64, Option<f64>)> = Vec::new();
+
+    for (e, freshness) in endpoints {
+        agg.endpoints_total += 1;
+        match freshness {
+            Freshness::Fresh if e.healthy != Some(false) => agg.endpoints_up += 1,
+            Freshness::Fresh => agg.endpoints_down += 1,
+            Freshness::Stale => agg.endpoints_stale += 1,
+            Freshness::Never => agg.endpoints_down += 1,
+        }
+        if freshness != Freshness::Fresh {
+            continue;
+        }
+
+        let e_agg = e.aggregate();
+        sum_opt(&mut agg.running, e_agg.running);
+        sum_opt(&mut agg.waiting, e_agg.waiting);
+        sum_opt(&mut agg.prompt_tps, e_agg.prompt_tps);
+        sum_opt(&mut agg.generation_tps, e_agg.generation_tps);
+        sum_opt(&mut agg.request_rate, e_agg.request_rate);
+        sum_opt(&mut agg.error_abort_delta, e_agg.error_abort_delta);
+
+        if let Some(worst) = e_agg.worst_ttft_p95
+            && agg.worst_ttft_p95.is_none_or(|cur| worst > cur)
+        {
+            agg.worst_ttft_p95 = Some(worst);
+            agg.worst_ttft_endpoint = Some(e.name.clone());
+        }
+
+        if let Some(curated) = &e.curated {
+            for series in curated.series.values() {
+                if let Some(usage) = series.kv_cache_usage {
+                    kv_pairs.push((usage, series.kv_cache_size_tokens));
+                }
+            }
+        }
+    }
+
+    agg.kv_usage = aggregate_kv(&kv_pairs);
+    agg
+}
+
 fn to_point(raw: &RawHistogram, at: Instant) -> Option<HistogramPoint> {
     HistogramPoint::new(at, raw.buckets.clone(), raw.sum, raw.count)
 }
@@ -586,6 +745,99 @@ mod tests {
                 ..Default::default()
             }),
         }
+    }
+
+    fn failed_scrape(at: Instant, secs_offset: f64, error: &str) -> ScrapeOutcome {
+        ScrapeOutcome {
+            at: at + Duration::from_secs_f64(secs_offset),
+            wall: SystemTime::now(),
+            duration: Duration::from_millis(10),
+            result: Err(error.to_string()),
+        }
+    }
+
+    #[test]
+    fn events_record_connect_failure_recovery_and_restart() {
+        use events::EventKind;
+        let base = Instant::now();
+        let mut e = ep();
+        e.apply(scrape(base, 0.0, &metrics_text(1000.0, 500.0, 10.0, 0.0)));
+        e.apply(failed_scrape(base, 1.0, "connection refused"));
+        // A second consecutive failure must not add another event.
+        e.apply(failed_scrape(base, 2.0, "connection refused"));
+        e.apply(scrape(base, 3.0, &metrics_text(1100.0, 550.0, 11.0, 0.0)));
+        // Counters go backwards: the server restarted.
+        e.apply(scrape(base, 4.0, &metrics_text(10.0, 5.0, 1.0, 0.0)));
+
+        let kinds: Vec<_> = e.events.iter_newest_first().map(|ev| ev.kind).collect();
+        assert_eq!(
+            kinds,
+            vec![
+                EventKind::Restarted,
+                EventKind::Recovered,
+                EventKind::Failed,
+                EventKind::Connected,
+            ]
+        );
+    }
+
+    #[test]
+    fn error_finishes_raise_an_event() {
+        use events::EventKind;
+        let base = Instant::now();
+        let mut e = ep();
+        e.apply(scrape(base, 0.0, &metrics_text(1000.0, 500.0, 10.0, 0.0)));
+        e.apply(scrape(base, 1.0, &metrics_text(1100.0, 550.0, 11.0, 2.0)));
+        assert!(
+            e.events
+                .iter_newest_first()
+                .any(|ev| ev.kind == EventKind::Errors)
+        );
+    }
+
+    #[test]
+    fn fleet_aggregate_counts_status_and_names_the_worst_endpoint() {
+        let base = Instant::now();
+        let mut a = EndpointState::new(
+            "a".into(),
+            "http://a".into(),
+            Duration::from_secs(300),
+            Duration::from_secs(60),
+        );
+        let mut b = EndpointState::new(
+            "b".into(),
+            "http://b".into(),
+            Duration::from_secs(300),
+            Duration::from_secs(60),
+        );
+        a.apply(scrape(base, 0.0, &metrics_text(1000.0, 500.0, 10.0, 0.0)));
+        b.apply(scrape(base, 0.0, &metrics_text(1000.0, 500.0, 10.0, 0.0)));
+        let down = EndpointState::new(
+            "c".into(),
+            "http://c".into(),
+            Duration::from_secs(300),
+            Duration::from_secs(60),
+        );
+
+        let fleet = aggregate_fleet(
+            [
+                (&a, Freshness::Fresh),
+                (&b, Freshness::Stale),
+                (&down, Freshness::Never),
+            ]
+            .into_iter(),
+        );
+        assert_eq!(fleet.endpoints_total, 3);
+        assert_eq!(fleet.endpoints_up, 1);
+        assert_eq!(fleet.endpoints_stale, 1);
+        assert_eq!(fleet.endpoints_down, 1);
+        // Only the fresh endpoint contributes activity: 2 running, not 4.
+        assert_eq!(fleet.running, Some(2.0));
+        // KV came from one fresh series with no capacity label.
+        assert!(matches!(
+            fleet.kv_usage,
+            Some(KvAggregate::UnweightedMean(v)) if (v - 0.4).abs() < 1e-9
+        ));
     }
 
     fn metrics_text(prompt: f64, generated: f64, stop: f64, error: f64) -> String {

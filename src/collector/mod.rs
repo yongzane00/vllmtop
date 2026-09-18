@@ -20,7 +20,7 @@ use tokio::sync::{mpsc, watch};
 use crate::config::{Config, EndpointConfig};
 use crate::event::AppEvent;
 use crate::metrics::parse::parse_text;
-use crate::state::{ScrapeOutcome, ScrapePayload};
+use crate::state::{ScrapeOutcome, ScrapePayload, ServedModel};
 
 /// Cap on a `/metrics` response body; beyond this the scrape is an error
 /// (runaway label cardinality would otherwise eat the monitor's memory).
@@ -426,14 +426,23 @@ async fn fetch_version(client: &reqwest::Client, endpoint: &EndpointConfig) -> O
         .map(|v| v.version)
 }
 
-async fn fetch_models(client: &reqwest::Client, endpoint: &EndpointConfig) -> Option<Vec<String>> {
+async fn fetch_models(
+    client: &reqwest::Client,
+    endpoint: &EndpointConfig,
+) -> Option<Vec<ServedModel>> {
     #[derive(serde::Deserialize)]
     struct Models {
         data: Vec<ModelEntry>,
     }
+    // `root` is the underlying HF repo id or local path; `id` is the served
+    // name (`--served-model-name`). LoRA adapter cards omit `max_model_len`.
     #[derive(serde::Deserialize)]
     struct ModelEntry {
         id: String,
+        #[serde(default)]
+        root: Option<String>,
+        #[serde(default)]
+        max_model_len: Option<u64>,
     }
     let url = endpoint_url(endpoint, "v1/models");
     let resp = client.get(&url).send().await.ok()?;
@@ -443,9 +452,16 @@ async fn fetch_models(client: &reqwest::Client, endpoint: &EndpointConfig) -> Op
     let body = read_capped(resp, "/v1/models", MAX_METADATA_BODY_BYTES)
         .await
         .ok()?;
-    serde_json::from_str::<Models>(&body)
-        .ok()
-        .map(|m| m.data.into_iter().map(|e| e.id).collect())
+    serde_json::from_str::<Models>(&body).ok().map(|m| {
+        m.data
+            .into_iter()
+            .map(|e| ServedModel {
+                id: e.id,
+                root: e.root,
+                max_model_len: e.max_model_len,
+            })
+            .collect()
+    })
 }
 
 /// reqwest errors include the URL; keep host/path but make sure no query or

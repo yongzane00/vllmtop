@@ -138,10 +138,85 @@ impl CuratedSeries {
     }
 }
 
+/// `cache_config_info` labels worth keeping. Never copy the whole label set:
+/// it is server-controlled and unbounded.
+const CACHE_CONFIG_LABELS: &[&str] = &[
+    "block_size",
+    "cache_dtype",
+    "enable_prefix_caching",
+    "gpu_memory_utilization",
+    "kv_cache_max_concurrency",
+    "kv_cache_size_tokens",
+    "num_gpu_blocks",
+    "sliding_window",
+];
+/// Kept label values are truncated to this many bytes.
+const MAX_LABEL_VALUE_BYTES: usize = 40;
+/// Upper bound on distinct HTTP status classes retained.
+const MAX_HTTP_STATUS_CLASSES: usize = 16;
+
+/// Endpoint-global facts that carry no `model_name` label and so cannot live
+/// on a per-series entry: the API-server process metrics, HTTP route
+/// counters, and a whitelist of `cache_config_info` labels.
+///
+/// Every field is `Option`/empty when the server did not expose it. Note that
+/// vLLM drops the default process collector under `--api-server-count > 1`,
+/// so all `process_*` fields legitimately vanish on some deployments.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct EndpointInfo {
+    /// Unix epoch seconds at which the API-server process started.
+    pub process_start_unix: Option<f64>,
+    /// Resident memory of the **HTTP front-end** process. In vLLM V1 the
+    /// model runs in a separate engine process, so this is NOT model or
+    /// KV-cache memory and must never be presented as such.
+    pub front_end_rss_bytes: Option<f64>,
+    /// Cumulative CPU seconds (a counter; the state layer turns it into a
+    /// live percentage).
+    pub process_cpu_seconds: Option<f64>,
+    pub open_fds: Option<f64>,
+    pub max_fds: Option<f64>,
+    /// Status class (`2xx`/`4xx`/`5xx`) → cumulative count, summed over
+    /// handlers and methods.
+    pub http_by_status: BTreeMap<String, f64>,
+    /// Whitelisted `cache_config_info` labels, kept verbatim — vLLM writes
+    /// the literal string `"None"` where it has no value.
+    pub cache_config: BTreeMap<&'static str, String>,
+}
+
+impl EndpointInfo {
+    /// A `cache_config_info` label parsed as a number, tolerating vLLM's
+    /// literal `"None"` and other non-numeric spellings.
+    pub fn cache_config_num(&self, key: &str) -> Option<f64> {
+        self.cache_config
+            .get(key)
+            .and_then(|v| v.parse::<f64>().ok())
+            .filter(|v| v.is_finite())
+    }
+
+    /// Fraction of the file-descriptor limit in use, when both are exposed.
+    pub fn open_fd_fraction(&self) -> Option<f64> {
+        match (self.open_fds, self.max_fds) {
+            (Some(open), Some(max)) if max > 0.0 => Some(open / max),
+            _ => None,
+        }
+    }
+
+    /// Total HTTP requests served across all status classes.
+    pub fn http_total(&self) -> Option<f64> {
+        if self.http_by_status.is_empty() {
+            None
+        } else {
+            Some(self.http_by_status.values().sum())
+        }
+    }
+}
+
 /// The curated view of one whole scrape.
 #[derive(Debug, Clone, Default)]
 pub struct CuratedScrape {
     pub series: BTreeMap<SeriesKey, CuratedSeries>,
+    /// Facts about the endpoint as a whole, not any one model series.
+    pub info: EndpointInfo,
     /// Canonical ids of curated metrics that were actually found — the
     /// endpoint's detected capabilities.
     pub capabilities: Vec<&'static str>,
@@ -241,6 +316,54 @@ pub fn curate(scrape: &ScrapeText) -> CuratedScrape {
                     s.external_prefix_cache_hits = Some(v)
                 });
             }
+            // Endpoint-global process metrics: unlabeled single series from
+            // prometheus_client's default collector. They describe the API
+            // server process only, and disappear entirely in multiprocess
+            // mode (`--api-server-count > 1`).
+            "process_start_time_seconds" => {
+                out.info.process_start_unix = first_value(family);
+                push_capability(&mut out.capabilities, "process_info");
+            }
+            "process_resident_memory_bytes" => {
+                out.info.front_end_rss_bytes = first_value(family);
+                push_capability(&mut out.capabilities, "process_info");
+            }
+            "process_cpu_seconds_total" => {
+                out.info.process_cpu_seconds = first_value(family);
+                push_capability(&mut out.capabilities, "process_info");
+            }
+            "process_open_fds" => {
+                out.info.open_fds = first_value(family);
+                push_capability(&mut out.capabilities, "process_info");
+            }
+            "process_max_fds" => {
+                out.info.max_fds = first_value(family);
+                push_capability(&mut out.capabilities, "process_info");
+            }
+            // Served by the FastAPI instrumentator, so it carries neither
+            // `model_name` nor `engine`. `status` is already bucketed to a
+            // class (`2xx`/`4xx`/`5xx`), never an exact code.
+            "http_requests_total" => {
+                for sample in &family.samples {
+                    let Some(status) = sample.labels.get("status") else {
+                        continue;
+                    };
+                    if !sample.value.is_finite() {
+                        continue;
+                    }
+                    let key = truncate_bytes(status, MAX_LABEL_VALUE_BYTES);
+                    // Bounded: a hostile server must not grow this map.
+                    if !out.info.http_by_status.contains_key(&key)
+                        && out.info.http_by_status.len() >= MAX_HTTP_STATUS_CLASSES
+                    {
+                        continue;
+                    }
+                    *out.info.http_by_status.entry(key).or_insert(0.0) += sample.value;
+                }
+                if !out.info.http_by_status.is_empty() {
+                    push_capability(&mut out.capabilities, "http_requests");
+                }
+            }
             "vllm:cache_config_info" => {
                 // Info gauge: interesting data lives in the labels, whose
                 // exact set varies by vLLM version — read defensively.
@@ -248,6 +371,17 @@ pub fn curate(scrape: &ScrapeText) -> CuratedScrape {
                     let get_num = |name: &str| -> Option<f64> {
                         sample.labels.get(name).and_then(|v| v.parse::<f64>().ok())
                     };
+                    // Keep a fixed whitelist for the info panel. Values stay
+                    // verbatim strings because vLLM writes "None" for absent
+                    // numbers (e.g. kv_cache_memory_bytes).
+                    for &label in CACHE_CONFIG_LABELS {
+                        if let Some(value) = sample.labels.get(label) {
+                            out.info
+                                .cache_config
+                                .insert(label, truncate_bytes(value, MAX_LABEL_VALUE_BYTES));
+                        }
+                    }
+                    push_capability(&mut out.capabilities, "cache_config");
                     // Newer vLLM exposes capacity directly; older versions
                     // expose block geometry instead.
                     let capacity = get_num("kv_cache_size_tokens").or_else(|| {
@@ -325,6 +459,27 @@ fn push_capability(caps: &mut Vec<&'static str>, cap: &'static str) {
     if !caps.contains(&cap) {
         caps.push(cap);
     }
+}
+
+/// The value of an unlabeled, single-series family (the `process_*` metrics).
+fn first_value(family: &MetricFamily) -> Option<f64> {
+    family
+        .samples
+        .first()
+        .map(|s| s.value)
+        .filter(|v| v.is_finite())
+}
+
+/// Truncate to at most `max` bytes on a char boundary.
+fn truncate_bytes(s: &str, max: usize) -> String {
+    if s.len() <= max {
+        return s.to_string();
+    }
+    let mut end = max;
+    while !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    s[..end].to_string()
 }
 
 /// Route a single-valued (per series) family into a field setter.
@@ -442,6 +597,68 @@ fn parse_le(raw: &str) -> Option<f64> {
 mod tests {
     use super::*;
     use crate::metrics::parse::parse_text;
+
+    /// Endpoint-global families: unlabeled `process_*`, HTTP counters with
+    /// no model/engine labels, and the cache-config whitelist.
+    const GLOBAL_SNIPPET: &str = r#"
+# TYPE process_start_time_seconds gauge
+process_start_time_seconds 1.78702152187e+09
+# TYPE process_resident_memory_bytes gauge
+process_resident_memory_bytes 2.53474816e+09
+# TYPE process_cpu_seconds_total counter
+process_cpu_seconds_total 207.16
+# TYPE process_open_fds gauge
+process_open_fds 63.0
+# TYPE process_max_fds gauge
+process_max_fds 65535.0
+# TYPE http_requests_total counter
+http_requests_total{handler="/v1/chat/completions",method="POST",status="2xx"} 106.0
+http_requests_total{handler="/v1/models",method="GET",status="2xx"} 135.0
+http_requests_total{handler="/v1/chat/completions",method="POST",status="5xx"} 1.0
+# TYPE vllm:cache_config_info gauge
+vllm:cache_config_info{engine="0",block_size="784",cache_dtype="auto",gpu_memory_utilization="0.45",kv_cache_memory_bytes="None",kv_cache_size_tokens="342803"} 1.0
+"#;
+
+    #[test]
+    fn endpoint_global_metrics_are_curated_despite_having_no_model_label() {
+        let info = curate(&parse_text(GLOBAL_SNIPPET)).info;
+        assert_eq!(info.process_start_unix, Some(1.78702152187e9));
+        assert_eq!(info.front_end_rss_bytes, Some(2.53474816e9));
+        assert_eq!(info.process_cpu_seconds, Some(207.16));
+        assert_eq!(info.open_fd_fraction(), Some(63.0 / 65535.0));
+        // Summed across handlers and methods, kept per status class.
+        assert_eq!(info.http_by_status.get("2xx"), Some(&241.0));
+        assert_eq!(info.http_by_status.get("5xx"), Some(&1.0));
+        assert_eq!(info.http_total(), Some(242.0));
+    }
+
+    #[test]
+    fn cache_config_keeps_whitelisted_labels_and_tolerates_none() {
+        let info = curate(&parse_text(GLOBAL_SNIPPET)).info;
+        assert_eq!(
+            info.cache_config_num("kv_cache_size_tokens"),
+            Some(342803.0)
+        );
+        assert_eq!(info.cache_config_num("gpu_memory_utilization"), Some(0.45));
+        assert_eq!(
+            info.cache_config.get("cache_dtype").map(String::as_str),
+            Some("auto")
+        );
+        // vLLM writes the literal string "None"; it must not become 0.
+        assert_eq!(info.cache_config_num("kv_cache_memory_bytes"), None);
+        // Whitelist only: unlisted labels are never copied.
+        assert!(!info.cache_config.contains_key("kv_cache_memory_bytes"));
+    }
+
+    #[test]
+    fn absent_endpoint_globals_stay_none_rather_than_zero() {
+        // The legacy fixture exposes none of these families.
+        let info = curate(&parse_text(SNIPPET)).info;
+        assert_eq!(info.process_start_unix, None);
+        assert_eq!(info.front_end_rss_bytes, None);
+        assert_eq!(info.open_fd_fraction(), None);
+        assert_eq!(info.http_total(), None);
+    }
 
     const SNIPPET: &str = r#"
 # TYPE vllm:num_requests_running gauge
